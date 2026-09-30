@@ -1,0 +1,10 @@
+docs/
+data/
+mmpose/
+__pycache__/
+*pth
+models/onnx/
+models/engines/
+tests/
+*.onnx
+*.engine
