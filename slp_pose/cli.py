@@ -20,8 +20,13 @@ Commands and options (argparse; defaults in brackets):
   check          --dataset --out-root --videos ID... [all committed]
                  -> record.check per video; prints problems and render commands for the suggested
                  windows; exit code 1 on problems.
-  render         VIDEO_ID --dataset --out-root --start-s S [0] --duration-s S [30] --persons
-                 --out PATH [<out-root>/renders/<vid>_<start frame>.mp4] -> render.render_video.
+  render         VIDEO_ID --dataset --out-root --start-s S [0] --duration-s S [30] | --full --persons
+                 --out PATH [<out-root>/renders/<vid>_<start frame>.mp4, <vid>_full.mp4 with --full]
+                 -> render.render_video.
+  render-done    --dataset --out-root --vis-dir DIR [<out-root>_vis] --jobs N [3] --videos ID...
+                 --limit N --follow --poll-s S [300] --no-persons
+                 -> render_batch.render_committed (read-only on the output root; logs in <vis-dir>;
+                 one run per vis dir); exit code 0 iff no video failed.
 Exit codes: 0 success; 1 failure (failed videos, check problems, parity gate); 2 bad arguments;
 130 interrupted.
 """
@@ -90,9 +95,25 @@ def build_parser() -> argparse.ArgumentParser:
     _dataset_option(p)
     _out_root_option(p)
     p.add_argument('--start-s', type=float, default=0.0, help='[0]')
-    p.add_argument('--duration-s', type=float, default=30.0, help='[30]')
+    length = p.add_mutually_exclusive_group()
+    length.add_argument('--duration-s', type=float, default=30.0, help='[30]')
+    length.add_argument('--full', action='store_true', help='the whole video, frame 0 to the end')
     p.add_argument('--persons', action='store_true', help='also draw the other people and candidate boxes')
-    p.add_argument('--out', type=Path, help='[<out-root>/renders/<vid>_<start frame>.mp4]')
+    p.add_argument('--out', type=Path, help='[<out-root>/renders/<vid>_<start frame>.mp4, <vid>_full.mp4 with --full]')
+
+    p = sub.add_parser('render-done', help='render every committed video, full length, while extraction runs')
+    _dataset_option(p)
+    _out_root_option(p)
+    p.add_argument('--vis-dir', type=Path, help='output directory [<out-root>_vis next to the output root]')
+    p.add_argument('--jobs', type=_positive(int), default=3, help='render processes at a time, at nice +10 [3]')
+    p.add_argument('--videos', nargs='+', metavar='ID', help='[every committed video]')
+    p.add_argument('--limit', type=int, help='render at most N videos')
+    p.add_argument('--follow', action='store_true',
+                   help='keep rendering new commits until the extraction has stopped and nothing is left')
+    p.add_argument('--poll-s', type=_positive(float), default=300.0,
+                   help='with --follow: seconds between looks for new commits [300]')
+    p.add_argument('--no-persons', dest='persons', action='store_false',
+                   help='draw the primary signer only (default: every person and candidate box)')
     return parser
 
 
@@ -197,17 +218,43 @@ def _render(args: argparse.Namespace) -> int:
     if args.video_id not in paths:
         log.error('%s: no such video in %s', args.video_id, dataset.name)
         return 1
+    if args.full and args.start_s:
+        log.error('--full renders the whole video; it takes no --start-s')
+        return 2
     video = probe(paths[args.video_id], args.video_id)
-    start = round(args.start_s * video.fps_num / video.fps_den)
-    count = round(args.duration_s * video.fps_num / video.fps_den)
-    out = args.out or root / 'renders' / f'{video.video_id}_{start}.mp4'
-    log.info('wrote %s', render_video(root, video, out, start, count, persons=args.persons))
+    if args.full:
+        start, count, name = 0, None, f'{video.video_id}_full.mp4'
+    else:
+        start = round(args.start_s * video.fps_num / video.fps_den)
+        count = round(args.duration_s * video.fps_num / video.fps_den)
+        name = f'{video.video_id}_{start}.mp4'
+    out = args.out or root / 'renders' / name
+    from .render_batch import sigterm_as_interrupt
+    with sigterm_as_interrupt():   # a killed render removes its .part file and stops its ffmpeg
+        log.info('wrote %s', render_video(root, video, out, start, count, persons=args.persons))
     return 0
+
+
+def _render_done(args: argparse.Namespace) -> int:
+    dataset, settings = DATASETS[args.dataset], Settings()
+    root = _out_root(args, dataset, settings)
+    from .render_batch import check_dirs, default_vis_dir, render_committed
+    vis_dir = (args.vis_dir or default_vis_dir(root)).resolve()
+    try:
+        check_dirs(root, vis_dir)
+    except ValueError as exc:
+        log.error('%s', exc)
+        return 2
+    _setup_logging(vis_dir, 'render-done')   # never into the output root
+    summary = render_committed(root, vis_dir, _video_paths(dataset, settings), jobs=args.jobs,
+                               video_ids=args.videos, limit=args.limit, follow=args.follow,
+                               persons=args.persons, poll_s=args.poll_s)
+    return 1 if summary.failed else 0
 
 
 _COMMANDS: Dict[str, Callable[[argparse.Namespace], int]] = {
     'build-engines': _build_engines, 'parity': _parity, 'extract': _extract, 'derive': _derive,
-    'check': _check, 'render': _render,
+    'check': _check, 'render': _render, 'render-done': _render_done,
 }
 
 
@@ -228,6 +275,16 @@ def _gpu_list(text: str) -> List[int]:
     if len(set(gpus)) != len(gpus):
         raise argparse.ArgumentTypeError(f'GPU indices must be distinct, got {text!r}')
     return gpus
+
+
+def _positive(kind: Callable[[str], float]) -> Callable[[str], float]:
+    """argparse type: `kind` of the text, which must be > 0."""
+    def parse(text: str) -> float:
+        value = kind(text)
+        if value <= 0:
+            raise argparse.ArgumentTypeError(f'must be > 0, got {text!r}')
+        return value
+    return parse
 
 
 def _out_root(args: argparse.Namespace, dataset: DatasetSpec, settings: Settings) -> Path:

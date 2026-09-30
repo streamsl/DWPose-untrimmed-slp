@@ -3,13 +3,16 @@
 CPU only: it reads the saved files, never initialises CUDA or builds a model, and streams one decoded
 frame at a time, so memory stays flat for any video or window length. `poses/<vid>.npy` and the
 members of `persons/<vid>.npz` (record.load_persons with mmap_mode='r') are memory-mapped; only the
-rows of the frame being drawn are read.
+rows of the frame being drawn are read. Frames are piped to an ffmpeg/libx264 process (H.264 mp4).
 The COCO-WholeBody-133 skeleton and colours come from mmpose's coco_wholebody metainfo.
 """
 from __future__ import annotations
 
+import errno
 import functools
 import os
+import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional, Tuple
@@ -19,7 +22,7 @@ import numpy as np
 
 from .settings import REPO_ROOT
 from .types import NUM_KEYPOINTS, POSED, VideoInfo
-from .video import VideoError
+from .video import VideoError, probe
 
 if TYPE_CHECKING:
     from .record import PersonsRecord
@@ -31,6 +34,8 @@ CANDIDATE_COLOR = (110, 110, 110)    # candidates that were not posed: thin boxe
 PRIMARY_BOX_COLOR = (0, 215, 255)    # the primary's box and score (with `persons`)
 TEXT_COLOR = (255, 255, 255)
 _SHIFT = 4                           # cv2 fractional bits: shapes are drawn at sub-pixel positions
+X264_OPTIONS = ('-c:v', 'libx264', '-preset', 'veryfast', '-crf', '26', '-pix_fmt', 'yuv420p',
+                '-movflags', '+faststart')
 
 
 @dataclass(frozen=True)
@@ -97,6 +102,74 @@ class FrameCursor:
 
     def __exit__(self, *exc) -> None:
         self.close()
+
+
+class H264Writer:
+    """Pipe BGR frames of `video`'s size into ffmpeg, which writes an H.264 mp4 at `path`.
+
+    The frame rate is the exact rational fps_num/fps_den. ffmpeg runs in its own session, so a
+    terminal Ctrl-C reaches only this process, which then kill()s it; its stderr goes to a
+    temporary file (a pipe could fill up and stall both processes). Every writer must end with
+    close() or kill(); both reap the ffmpeg process.
+    """
+
+    def __init__(self, path: Path, video: VideoInfo) -> None:
+        self.path = Path(path)
+        self.frames = 0
+        self._shape = (video.height, video.width, 3)
+        cmd = ['ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'error', '-y',
+               '-f', 'rawvideo', '-pix_fmt', 'bgr24', '-video_size', f'{video.width}x{video.height}',
+               '-framerate', f'{video.fps_num}/{video.fps_den}', '-i', 'pipe:0',
+               '-an', *X264_OPTIONS, '-f', 'mp4', str(self.path)]
+        self._stderr = tempfile.TemporaryFile()
+        try:
+            self._proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                                          stderr=self._stderr, start_new_session=True)
+        except BaseException:
+            self._stderr.close()
+            raise
+
+    def write(self, image: np.ndarray) -> None:
+        """Append one (H,W,3) uint8 BGR frame."""
+        if image.shape != self._shape or image.dtype != np.uint8:
+            raise ValueError(f'frame is {image.dtype} {image.shape}, expected uint8 {self._shape}')
+        try:
+            self._proc.stdin.write(np.ascontiguousarray(image).data)
+        except BrokenPipeError:
+            raise RuntimeError(f'ffmpeg stopped reading after {self.frames} frames: {self._reap()}') from None
+        self.frames += 1
+
+    def close(self) -> None:
+        """End the input and wait; raise RuntimeError if ffmpeg failed or printed an error."""
+        try:
+            self._proc.stdin.close()
+        except BrokenPipeError:   # ffmpeg is gone; _reap says why
+            pass
+        error = self._reap()
+        if error:
+            raise RuntimeError(f'ffmpeg failed writing {self.path}: {error}')
+
+    def kill(self) -> None:
+        """Stop ffmpeg at once and reap it (idempotent); the partial file is the caller's."""
+        if self._proc.poll() is None:
+            self._proc.kill()
+        self._reap()
+
+    def _reap(self) -> str:
+        """Wait for ffmpeg and release its pipes; its error, '' after a clean exit (or a second call)."""
+        code = self._proc.wait()
+        try:
+            self._proc.stdin.close()
+        except OSError:           # frames still buffered for a process that is gone
+            pass
+        if self._stderr.closed:
+            return ''
+        self._stderr.seek(0)
+        text = self._stderr.read().decode(errors='replace').strip()
+        self._stderr.close()
+        if code:
+            return f'exit status {code}: {text}' if text else f'exit status {code}'
+        return text
 
 
 def _point(xy: np.ndarray) -> Tuple[int, int]:
@@ -175,8 +248,11 @@ def render_video(root: Path, video: VideoInfo, out_path: Path, start_frame: int 
       (skeleton_links, keypoint/link colours); with `persons`, the other posed people in grey with
       their boxes and detector scores, the primary's box in gold, non-posed candidates as thin grey
       boxes. The top-left corner shows the frame index, time and (with `persons`) num_persons.
-    - Writes an mp4 (cv2.VideoWriter 'mp4v') at the native fps (fps_num / fps_den) and returns
-      `out_path`. num_frames None = to the end of the saved poses.
+    - Writes an H.264 mp4 (H264Writer, X264_OPTIONS) at the exact native fps fps_num/fps_den to
+      <out_path>.<pid>.part (one name per process, so concurrent renders of one output never share
+      a file), checks its frame count, size and fps with ffprobe, moves it to `out_path` with
+      durable_replace and returns that. On any error or interrupt ffmpeg is killed and reaped and
+      the .part file removed. num_frames None = to the end of the saved poses.
     """
     root, out_path = Path(root), Path(out_path)
     poses = np.load(root / 'poses' / f'{video.video_id}.npy', mmap_mode='r')
@@ -192,11 +268,8 @@ def render_video(root: Path, video: VideoInfo, out_path: Path, start_frame: int 
     unit = max(1, round(max(video.width, video.height) / 480))
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = out_path.with_name(out_path.stem + '.part' + out_path.suffix)
-    writer = cv2.VideoWriter(str(tmp), cv2.VideoWriter_fourcc(*'mp4v'), video.fps_num / video.fps_den,
-                             (video.width, video.height))
-    if not writer.isOpened():
-        raise RuntimeError(f'cv2 cannot write {tmp}')
+    tmp = out_path.with_name(f'{out_path.name}.{os.getpid()}.part')
+    writer = H264Writer(tmp, video)
     try:
         with FrameCursor(video.path) as cursor:
             for t in range(start_frame, end):
@@ -216,10 +289,39 @@ def render_video(root: Path, video: VideoInfo, out_path: Path, start_frame: int 
                 cv2.putText(image, hud, (4 * unit, 14 * unit), cv2.FONT_HERSHEY_SIMPLEX, 0.4 * unit, TEXT_COLOR, 1,
                             cv2.LINE_AA)
                 writer.write(image)
+        writer.close()
+        _check_encoded(tmp, video, end - start_frame)
+        durable_replace(tmp, out_path)
     except BaseException:
-        writer.release()
+        writer.kill()
         tmp.unlink(missing_ok=True)
         raise
-    writer.release()
-    os.replace(tmp, out_path)
     return out_path
+
+
+def durable_replace(src: Path, dst: Path) -> None:
+    """os.replace(src, dst) with src fsynced before and dst's directory after, so that after a crash
+    `dst` is either its old file or all of `src` (ffmpeg itself never fsyncs)."""
+    _fsync(src)
+    os.replace(src, dst)
+    _fsync(Path(dst).parent)
+
+
+def _fsync(path: Path) -> None:
+    fd = os.open(str(path), os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    except OSError as e:
+        if e.errno != errno.EINVAL:   # some filesystems cannot fsync a directory; renames stay atomic
+            raise
+    finally:
+        os.close(fd)
+
+
+def _check_encoded(path: Path, video: VideoInfo, num_frames: int) -> None:
+    """The encoded file must hold exactly the frames written, at the video's size and rational fps."""
+    got = probe(path)
+    have = (got.nb_frames, got.width, got.height, got.fps_num, got.fps_den)
+    want = (num_frames, video.width, video.height, video.fps_num, video.fps_den)
+    if have != want:
+        raise RuntimeError(f'{path}: encoded (frames, width, height, fps_num, fps_den) {have}, expected {want}')
