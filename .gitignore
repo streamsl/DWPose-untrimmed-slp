@@ -6,5 +6,9 @@ __pycache__/
 models/onnx/
 models/engines/
 tests/
+pytest.ini
 *.onnx
 *.engine
+*.egg-info/
+build/
+dist/

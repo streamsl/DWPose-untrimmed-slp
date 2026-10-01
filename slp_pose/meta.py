@@ -78,7 +78,7 @@ def _slot_motion(xy: np.ndarray) -> Optional[float]:
     xy: (n, 6, 2) float64 in frame order: right shoulder, left shoulder, then COCO_ARMS. Every step
     matches the original element for element except the shoulder-width norm, which is vectorised
     here and a per-row np.linalg.norm (a BLAS dot) there; the two agree bit for bit on this
-    machine's OpenBLAS, and tests/test_meta.py checks the final value for exact equality.
+    machine's OpenBLAS, and the test suite checks the final value for exact equality.
     """
     right, left = xy[:, 0], xy[:, 1]
     finite = np.flatnonzero(np.isfinite(right).all(axis=-1) & np.isfinite(left).all(axis=-1))

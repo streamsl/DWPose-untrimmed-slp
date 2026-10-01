@@ -13,12 +13,19 @@ charged, and each video its reader had already claimed (decoded ahead, maybe the
 becomes a suspect and goes to the back of the queue, away from its neighbour; a video suspected
 in MAX_ATTEMPTS deaths is failed. The worker's other tasks go back to the front unchanged.
 
+Final rule (spec D14): workers commit with the dataset's per-frame extraction rule; when the
+dataset's primary rule differs (e.g. a video-level rule), the parent derives each commit with it on
+the CPU before counting the video as done, so `extract` leaves final outputs. A video committed
+but not derived yet (a stop or crash in between) has the extraction rule's derivation_hash, so the
+next run derives it (record.resume_action -> 'derive').
+
 Host RAM stays small: the parent keeps per-video bookkeeping only, never per-frame data.
 """
 from __future__ import annotations
 
 import collections
 import contextlib
+import csv
 import dataclasses
 import logging
 import multiprocessing
@@ -35,13 +42,15 @@ from pathlib import Path
 from typing import Callable, Deque, Dict, Iterator, List, Optional, Sequence, Set, Tuple
 
 from . import record
-from .settings import DatasetSpec, Settings
+from .datasets import Dataset, Video, index_table, load_videos, schedule
+from .settings import Settings
 from .types import VideoInfo
 from .worker import VideoTask, WorkerEvent, worker_main
 
 log = logging.getLogger(__name__)
 
 PREFETCH = 2       # tasks outstanding per worker: the video in progress + the one decoded ahead
+VIDEO_INDEX = 'video_ids.csv'   # <out_root>/video_ids.csv: datasets.index_table of every video
 MAX_ATTEMPTS = 2   # a failed video is requeued once
 _STOP_SIGNALS = (signal.SIGINT, signal.SIGTERM)
 
@@ -72,54 +81,47 @@ class Timing:
     merge_every: int = 50            # rewrite video_meta.csv after this many commits
 
 
-def plan_videos(dataset: DatasetSpec, settings: Settings, video_ids: Optional[Sequence[str]] = None,
-                limit: Optional[int] = None, probe_threads: int = 8) -> List[VideoInfo]:
-    """Probe (video.probe, threaded) and order the dataset's videos.
+def plan_videos(videos: Sequence[Video], split_order: Sequence[str] = (),
+                video_ids: Optional[Sequence[str]] = None, limit: Optional[int] = None,
+                probe_threads: int = 8) -> List[VideoInfo]:
+    """Probe (video.probe, threaded) and order a dataset's videos (datasets.load_videos).
 
-    Order: dataset.split_order (split lists from dataset.splits()), largest file first within a
-    split (file size, ties by video_id); videos in no split come last, largest first.
-    `video_ids` restricts the set (unknown ids raise ValueError); `limit` keeps the first N, and
-    only those are probed. Probe failures (video.VideoError, e.g. VFR) are raised with the video id.
+    Order: datasets.schedule (split_order, then the largest file first). `video_ids` restricts the
+    set (unknown ids raise ValueError); `limit` keeps the first N, and only those are probed. Probe
+    failures (video.VideoError, e.g. VFR) are raised with the video id.
     """
     from .video import VideoError, probe
-    paths: Dict[str, Path] = {}
-    for path in dataset.video_paths(settings.repo_root):
-        vid = dataset.video_id(path)
-        if vid in paths:
-            raise ValueError(f'{dataset.name}: two videos have the id {vid!r}: {paths[vid]} and {path}')
-        paths[vid] = path
+    by_id = {video.video_id: video for video in videos}
     if video_ids is not None:
-        unknown = sorted(set(video_ids) - set(paths))
+        unknown = sorted(set(video_ids) - set(by_id))
         if unknown:
-            raise ValueError(f'{dataset.name}: unknown video ids {unknown}')
-        paths = {vid: paths[vid] for vid in video_ids}
-    splits = dataset.splits(settings.repo_root)
-    rank: Dict[str, int] = {}
-    for i, ids in enumerate(splits.values()):
-        for vid in ids:
-            rank.setdefault(vid, i)
-    sizes = {vid: os.path.getsize(path) for vid, path in paths.items()}
-    order = sorted(paths, key=lambda vid: (rank.get(vid, len(splits)), -sizes[vid], vid))[:limit]
+            raise ValueError(f'unknown video ids {unknown}')
+        by_id = {vid: by_id[vid] for vid in video_ids}
+    sizes = {vid: os.path.getsize(video.path) for vid, video in by_id.items()}
+    order = schedule(by_id.values(), split_order, sizes)[:limit]
 
-    def probe_one(vid: str) -> VideoInfo:
+    def probe_one(video: Video) -> VideoInfo:
         try:
-            return probe(paths[vid], vid)
+            return probe(video.path, video.video_id)
         except VideoError as e:
-            raise VideoError(f'{vid}: {e}') from e
+            raise VideoError(f'{video.video_id}: {e}') from e
 
     with ThreadPoolExecutor(probe_threads) as pool:
         return list(pool.map(probe_one, order))
 
 
-def run_extract(dataset: DatasetSpec, settings: Settings, out_root: Path, gpus: Sequence[int],
+def run_extract(dataset: Dataset, settings: Settings, out_root: Path, gpus: Sequence[int],
                 video_ids: Optional[Sequence[str]] = None, limit: Optional[int] = None,
                 allow_frame_mismatch: bool = False, *, timing: Timing = Timing(),
                 worker_target: Callable = worker_main) -> RunSummary:
     """Extract `dataset` into `out_root` with one worker process (`worker_target`) per GPU.
 
-    - Holds an exclusive lock on out_root (root_lock), clears .work/ once, then per video
+    - Lists the dataset's videos (datasets.load_videos: the plugin contract is checked first).
+    - Holds an exclusive lock on out_root (root_lock), clears .work/ once, writes
+      <out_root>/video_ids.csv (every video of the dataset, datasets.index_table), then per video
       record.resume_action decides skip / derive (record.derive on the CPU here, interleaved with
-      supervising the workers) / extract.
+      supervising the workers) / extract (workers use dataset.extraction_rule; the parent then
+      derives the commit with dataset.primary_rule when that differs, see the module docstring).
     - Workers are started on demand (spawn context); see the module docstring for scheduling and
       the failure policy. A GPU whose worker needed more than timing.respawn_limit respawns
       within timing.respawn_window_s takes no more work. A worker silent for timing.watchdog_s
@@ -139,11 +141,15 @@ def run_extract(dataset: DatasetSpec, settings: Settings, out_root: Path, gpus: 
     if not gpus or len(set(gpus)) != len(gpus):
         raise ValueError(f'need distinct GPU indices, got {gpus}')
     summary = RunSummary()
+    all_videos = load_videos(dataset)
     with root_lock(out_root), _sigterm_as_interrupt():
         record.clear_work(out_root)
-        extraction_hash = record.extraction_hash(settings, engines.model_provenance(settings))
+        write_video_index(out_root / VIDEO_INDEX, *index_table(all_videos, dataset.data_root))
+        model_provenance = engines.model_provenance(settings)
+        worker_hash = record.extraction_hash(settings, model_provenance)   # what a worker reports when ready
+        extraction_hash = record.extraction_hash(settings, model_provenance, dataset.extraction_rule)
         derivation_hash = record.derivation_hash(settings, dataset.primary_rule)
-        videos = plan_videos(dataset, settings, video_ids, limit)
+        videos = plan_videos(all_videos, dataset.split_order, video_ids, limit)
         tasks, derives = [], []
         for video in videos:
             action = record.resume_action(out_root, video.video_id, extraction_hash, derivation_hash)
@@ -152,12 +158,12 @@ def run_extract(dataset: DatasetSpec, settings: Settings, out_root: Path, gpus: 
             elif action == 'derive':
                 derives.append(video.video_id)
             else:
-                tasks.append(VideoTask(video, str(out_root), dataset.primary_rule, allow_frame_mismatch))
+                tasks.append(VideoTask(video, str(out_root), dataset.extraction_rule, allow_frame_mismatch))
         log.info('%s -> %s: %d videos, %d to extract (%d frames), %d to derive, %d already done',
                  dataset.name, out_root, len(videos), len(tasks), sum(t.video.nb_frames for t in tasks),
                  len(derives), len(summary.skipped))
-        supervisor = _Supervisor(settings, out_root, gpus, timing, worker_target, extraction_hash,
-                                 dataset.primary_rule, summary, len(videos))
+        supervisor = _Supervisor(settings, out_root, gpus, timing, worker_target, worker_hash,
+                                 dataset.primary_rule, derivation_hash, summary, len(videos))
         try:
             supervisor.run(tasks, derives)
         finally:
@@ -179,11 +185,25 @@ def run_derive(out_root: Path, settings: Settings, primary_rule: str,
     with root_lock(out_root), _sigterm_as_interrupt():
         try:
             for vid in committed_videos(out_root) if video_ids is None else video_ids:
-                (derived if _derive_video(out_root, vid, settings, primary_rule) else failed).append(vid)
+                with deferred_interrupt():   # a Ctrl-C held during the derive is raised after the bookkeeping
+                    (derived if _derive_video(out_root, vid, settings, primary_rule) else failed).append(vid)
         finally:
             with deferred_interrupt():
                 merge_meta(out_root)
     return derived, failed
+
+
+def write_video_index(path: Path, header: Sequence[str], rows: Sequence[Dict[str, str]]) -> None:
+    """Write a video index CSV (datasets.index_table) atomically: temp file, fsync, rename."""
+    tmp = path.with_name(path.name + '.tmp')
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(tmp, 'w', encoding='utf-8', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=list(header))
+        writer.writeheader()
+        writer.writerows(rows)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
 
 
 def merge_meta(out_root: Path) -> Path:
@@ -259,7 +279,12 @@ def _sigterm_as_interrupt() -> Iterator[None]:
 
 
 def _derive_video(out_root: Path, video_id: str, settings: Settings, primary_rule: str) -> bool:
-    """record.derive with Ctrl-C held; a failure is logged and recorded (attempt 1, no GPU)."""
+    """record.derive with Ctrl-C held; a failure is logged and recorded (attempt 1, no GPU).
+
+    A Ctrl-C held here is raised when the block ends, before this returns: callers that count the
+    result call this inside their own deferred_interrupt block (nested blocks are no-ops), so the
+    interrupt comes after their bookkeeping.
+    """
     with deferred_interrupt():
         try:
             record.derive(out_root, video_id, settings, primary_rule)
@@ -314,19 +339,21 @@ class _Supervisor:
     """The event loop of one extract run: derive, dispatch, supervise the workers, report."""
 
     def __init__(self, settings: Settings, out_root: Path, gpus: Sequence[int], timing: Timing, target: Callable,
-                 extraction_hash: str, primary_rule: str, summary: RunSummary, num_videos: int) -> None:
+                 worker_hash: str, primary_rule: str, derivation_hash: str, summary: RunSummary,
+                 num_videos: int) -> None:
         self._ctx = multiprocessing.get_context('spawn')
         self._settings = settings
         self._root = out_root
         self._timing = timing
         self._target = target
-        self._extraction_hash = extraction_hash
+        self._worker_hash = worker_hash
         self._rule = primary_rule
+        self._derivation_hash = derivation_hash
         self._summary = summary
         self._num_videos = num_videos
         self._slots = [_Slot(gpu) for gpu in gpus]
         self._queue: Deque[VideoTask] = collections.deque()
-        self._derives: Deque[str] = collections.deque()
+        self._derives: Deque[Tuple[str, bool]] = collections.deque()   # (video, just extracted)
         self._todo: Dict[str, int] = {}          # unfinished video -> nb_frames, for the ETA
         self._suspects: Dict[str, int] = collections.Counter()
         self._commits = 0
@@ -338,7 +365,7 @@ class _Supervisor:
 
     def run(self, tasks: Sequence[VideoTask], derives: Sequence[str]) -> None:
         self._queue.extend(tasks)
-        self._derives.extend(derives)
+        self._derives.extend((vid, False) for vid in derives)
         self._todo = {t.video.video_id: t.video.nb_frames for t in tasks}
         try:
             while self._work_left():
@@ -356,7 +383,7 @@ class _Supervisor:
                 self._kill_workers()
                 if self._sampler is not None:
                     self._sampler.stop()
-                self._summary.pending = [t.video.video_id for t in self._queue] + list(self._derives)
+                self._summary.pending = [t.video.video_id for t in self._queue] + [vid for vid, _ in self._derives]
                 merge_meta(self._root)
 
     # ------------------------------------------------------------------ main loop
@@ -367,12 +394,13 @@ class _Supervisor:
 
     def _step(self) -> None:
         if self._derives:
-            vid = self._derives.popleft()
-            if _derive_video(self._root, vid, self._settings, self._rule):
-                self._summary.derived.append(vid)
-                self._committed()
-            else:
-                self._summary.failed.append(vid)
+            vid, extracted = self._derives.popleft()
+            with deferred_interrupt():   # a Ctrl-C held during the derive is raised after the bookkeeping
+                if _derive_video(self._root, vid, self._settings, self._rule):
+                    (self._summary.done if extracted else self._summary.derived).append(vid)
+                    self._committed()
+                else:
+                    self._summary.failed.append(vid)
         self._start_workers()
         self._dispatch()
         self._pump(0.0 if self._derives else 1.0)
@@ -470,7 +498,7 @@ class _Supervisor:
     def _on_event(self, s: _Slot, ev: WorkerEvent) -> None:
         vid = ev.video_id
         if ev.kind == 'ready':
-            if ev.payload.get('extraction_hash') != self._extraction_hash and not self._stopping:
+            if ev.payload.get('extraction_hash') != self._worker_hash and not self._stopping:
                 raise RuntimeError(f'GPU{s.gpu}: the worker computes a different extraction hash than the parent '
                                    f'(models, engines or settings changed?)')
             log.info('GPU%d: ready (%s)', s.gpu, ev.payload.get('gpu_name'))
@@ -484,11 +512,14 @@ class _Supervisor:
             self._count_frames(s, vid, ev.frames)
             self._finish(s, vid)
             self._todo.pop(vid, None)
-            self._summary.done.append(vid)
             self._summary.frames += ev.frames
             log.info('%s: done on GPU%d, %d frames in %.0f s (%.1f fps)', vid, s.gpu, ev.frames, ev.seconds,
                      ev.frames / max(ev.seconds, 1e-9))
-            self._committed()
+            if ev.payload.get('derivation_hash') == self._derivation_hash:
+                self._summary.done.append(vid)
+                self._committed()
+            else:   # committed with the extraction rule: derive the final rule next
+                self._derives.append((vid, True))
         elif ev.kind == 'failed':
             task = self._finish(s, vid)
             if task is not None:

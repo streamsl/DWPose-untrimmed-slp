@@ -20,14 +20,14 @@ from typing import TYPE_CHECKING, Optional, Tuple
 import cv2
 import numpy as np
 
-from .settings import REPO_ROOT
 from .types import NUM_KEYPOINTS, POSED, VideoInfo
 from .video import VideoError, probe
 
 if TYPE_CHECKING:
     from .record import PersonsRecord
 
-COCO_WHOLEBODY_METAINFO = Path('mmpose') / 'configs' / '_base_' / 'datasets' / 'coco_wholebody.py'
+# Inside the mmpose package: shipped by its wheel, linked to ../configs by an editable install.
+COCO_WHOLEBODY_METAINFO = Path('.mim') / 'configs' / '_base_' / 'datasets' / 'coco_wholebody.py'
 # BGR colours of everything that is not the primary's skeleton.
 OTHER_COLOR = (170, 170, 170)        # other posed people: skeleton, box and detector score
 CANDIDATE_COLOR = (110, 110, 110)    # candidates that were not posed: thin boxes
@@ -48,10 +48,11 @@ class Skeleton:
 
 
 @functools.lru_cache(maxsize=None)
-def coco_wholebody_skeleton(repo_root: Path = REPO_ROOT) -> Skeleton:
+def coco_wholebody_skeleton() -> Skeleton:
     """Skeleton links and colours from mmpose's coco_wholebody.py (RGB there, as mmpose draws on RGB)."""
+    import mmpose
     from mmpose.datasets.datasets.utils import parse_pose_metainfo
-    meta = parse_pose_metainfo(dict(from_file=str(Path(repo_root) / COCO_WHOLEBODY_METAINFO)))
+    meta = parse_pose_metainfo(dict(from_file=str(Path(mmpose.__file__).parent / COCO_WHOLEBODY_METAINFO)))
     if meta['num_keypoints'] != NUM_KEYPOINTS:
         raise ValueError(f"coco_wholebody metainfo has {meta['num_keypoints']} keypoints")
 

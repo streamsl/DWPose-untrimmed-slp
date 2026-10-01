@@ -6,13 +6,27 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
-from .settings import REPO_ROOT
+from .paths import REPO_ROOT
 
-PINNED_VERSIONS = {'torch': '2.1.2', 'mmcv': '2.1.0', 'mmdet': '3.3.0', 'mmpose': '1.3.2',
-                   'tensorrt': '10.13.3.9'}
+_COMMON_PINS = {'torch': '2.1.2', 'mmcv': '2.1.0', 'mmdet': '3.3.0', 'mmpose': '1.3.2'}
+# TensorRT of each locked environment: requirements-py38.txt (the BOBSL machine, engines built and
+# parity-gated with 10.13.3.9) and requirements.txt (Python 3.11, the newest TensorRT 10). Engines
+# are rebuilt per machine and their sha256 is in the extraction hash, so outputs of different
+# TensorRT versions never pass for each other on resume.
+TENSORRT_VERSIONS = {(3, 8): '10.13.3.9', (3, 11): '10.16.1.11'}
+
+
+def pinned_versions(python: Tuple[int, int] = tuple(sys.version_info[:2])) -> Dict[str, str]:
+    """The library versions a worker requires at start-up under Python `python` (major, minor):
+    those of its lock file; a Python without one (3.9, 3.10) takes the 3.8 pins."""
+    return dict(_COMMON_PINS, tensorrt=TENSORRT_VERSIONS.get(tuple(python), TENSORRT_VERSIONS[(3, 8)]))
+
+
+PINNED_VERSIONS = pinned_versions()   # of this interpreter
 
 
 class EnvironmentProblem(RuntimeError):
@@ -58,13 +72,17 @@ def library_versions(include_trt: bool = True) -> Dict[str, str]:
 
 
 def environment_problems(need_trt: bool, repo_root: Path = REPO_ROOT) -> List[str]:
-    """Everything wrong with the environment, as human-readable lines (empty = fine)."""
+    """Everything wrong with the environment, as human-readable lines (empty = fine).
+
+    A source checkout with its own ./mmpose copy must import that copy; elsewhere (a pip install)
+    the pinned mmpose version is enough.
+    """
     import mmpose
     problems = []
-    expected = (Path(repo_root) / 'mmpose' / 'mmpose').resolve()
+    local = Path(repo_root) / 'mmpose' / 'mmpose'
     got = Path(mmpose.__file__ or '').resolve().parent
-    if got != expected:
-        problems.append(f'mmpose imported from {got}, expected {expected} (check .venv easy-install.pth)')
+    if local.is_dir() and got != local.resolve():
+        problems.append(f'mmpose imported from {got}, expected {local.resolve()} (check .venv easy-install.pth)')
     versions = library_versions(include_trt=need_trt)
     for name, want in PINNED_VERSIONS.items():
         if name == 'tensorrt' and not need_trt:

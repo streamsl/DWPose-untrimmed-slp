@@ -1,0 +1,67 @@
+# slp-pose: DWPose whole-body keypoints for untrimmed sign-language videos.
+#
+# The tested, exact environments are requirements.txt (Python 3.11, newest stack) and requirements-py38.txt
+# (the BOBSL machine); scripts/setup_env.sh builds one from a fresh clone. The ranges below admit both.
+# A manual install without the lock files, into a Python 3.11 venv, takes torch from the PyTorch index,
+# mmcv from the OpenMMLab wheels (PyPI has only an sdist that compiles for 20+ minutes) and TensorRT from
+# pypi.nvidia.com (PyPI's tensorrt-cu12-libs is a stub that downloads it at build time). mmpose requires
+# chumpy (never imported), an sdist whose setup.py imports pip, so it is built without build isolation:
+#   pip install -U pip 'setuptools<82'
+#   pip install 'numpy<2' torch==2.1.2 torchvision==0.16.2 \
+#       --extra-index-url https://download.pytorch.org/whl/cu121
+#   pip install --no-build-isolation chumpy==0.70
+#   pip install './DWPose-untrimmed-slp[trt]' --extra-index-url https://pypi.nvidia.com \
+#       -f https://download.openmmlab.com/mmcv/dist/cu121/torch2.1/index.html
+#
+# Dataset plugins: a package can provide datasets through the entry-point group "slp_pose.datasets"
+# (name = dataset name, value = a Dataset subclass or a module defining one), e.g. in its pyproject.toml:
+#   [project.entry-points."slp_pose.datasets"]
+#   my_data = "my_package.my_data:MyData"
+
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "slp-pose"
+dynamic = ["version"]
+description = "DWPose whole-body keypoints for untrimmed sign-language videos, in the youtube-sl-25 schema"
+readme = "README.md"
+requires-python = ">=3.8,<3.12"   # torch 2.1 and the mmcv 2.1.0 wheels stop at 3.11
+authors = [{ name = "Quan Dang" }]
+# Exact where slp_pose.env checks the version at worker start-up, and the torchvision of that torch
+# (the +cu121 builds match ==2.1.2 / ==0.16.2).
+dependencies = [
+    "torch==2.1.2",
+    "torchvision==0.16.2",
+    "numpy>=1.20,<2",
+    "opencv-python",
+    "mmcv==2.1.0",
+    "mmengine>=0.10,<1",
+    "mmdet==3.3.0",
+    "mmpose==1.3.2",
+    "setuptools<82",   # mmengine imports pkg_resources, which setuptools 82 removed
+]
+
+[project.optional-dependencies]
+# TensorRT engines (the default backend): TensorRT 10 from https://pypi.nvidia.com (tensorrt-cu12
+# provides `import tensorrt` and pulls in its -libs and -bindings), plus the ONNX export tools of
+# `build-engines` (onnxsim folds constants with ONNX Runtime).
+trt = [
+    "tensorrt-cu12>=10.13.3.9,<11",
+    "onnx>=1.17",
+    "onnxsim>=0.4.36",
+    "onnxruntime",
+]
+
+[project.scripts]
+slp-pose = "slp_pose.cli:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "slp_pose.__version__" }
+
+[tool.setuptools.packages.find]
+include = ["slp_pose", "slp_pose.*"]
+
+[tool.setuptools.package-data]
+"slp_pose.model_configs" = ["*.py"]

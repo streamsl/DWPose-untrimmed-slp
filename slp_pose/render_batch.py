@@ -131,11 +131,14 @@ def render_committed(out_root: Path, vis_dir: Path, video_paths: Mapping[str, Pa
       at most `limit` videos; up to `jobs` render processes at a time, each of which is stopped
       when this process dies. `video_paths` maps ids to source videos.
     - A failed video is logged and skipped (retried only once its done marker changes); a render
-      whose done marker changed meanwhile is discarded and counts as failed.
+      whose done marker changed meanwhile is discarded and counts as failed until a later render
+      of the same video in this run succeeds (summary.failed lists the videos still failed).
     - Without `follow`, returns once nothing is left to render. With `follow`, looks for new
       commits every `poll_s` s while a render slot is free and returns once nothing is left and
       no extraction holds the root (extraction_running is sampled before each listing, so a video
-      committed just before the extraction ended is still rendered).
+      committed just before the extraction ended is still rendered). Start it once the extraction
+      holds the root (its log shows '<dataset> -> <root>: N videos ...'): when no extraction holds
+      the root at the start, a warning says so and it behaves as without `follow`.
     - Ctrl-C or SIGTERM stops the render processes (each kills its ffmpeg and deletes its .part
       file), then KeyboardInterrupt is re-raised.
     """
@@ -150,6 +153,10 @@ def render_committed(out_root: Path, vis_dir: Path, video_paths: Mapping[str, Pa
         batch = _Batch(out_root, vis_dir, video_paths, jobs, video_ids, limit, persons)
         log.info('render-done: %s -> %s, %d committed videos, %d jobs%s', out_root, vis_dir,
                  len(committed_videos(out_root)), jobs, ', following the extraction' if follow else '')
+        if follow and not extraction_running(out_root):
+            log.warning('--follow: no extract or derive run holds %s now, so render-done returns once the '
+                        'videos committed so far are rendered (start it after the extraction has started)',
+                        out_root)
         try:
             while True:
                 active = follow and extraction_running(out_root)
@@ -247,6 +254,9 @@ class _Batch:
             log.error('%s: render failed: %s', vid, result.error)
             return
         self._settled.add(vid)
+        self._failed_at.pop(vid, None)
+        if vid in s.failed:   # an earlier attempt in this run failed, e.g. discarded as its marker changed
+            s.failed.remove(vid)
         s.rendered.append(vid)
         s.frames += result.frames
         s.size_bytes += result.size_bytes

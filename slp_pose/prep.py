@@ -1,7 +1,7 @@
 """Exact CPU image preparation (spec D10): detector letterbox and pose crops.
 
 Both call the same mmcv / mmpose functions as the official pipelines, so the bytes are identical
-by construction (tests/test_prep.py checks them against the pipelines):
+by construction (the test suite checks them against the pipelines):
 - letterbox = mmdet `Resize(scale=(640, 640), keep_ratio=True)` (mmcv.imrescale, bilinear) +
   `Pad(pad_to_square=True, pad_val=114)` on the bottom/right;
 - crop = mmpose `GetBBoxCenterScale(padding=1.25)` + `TopdownAffine(input_size=(288, 384))`

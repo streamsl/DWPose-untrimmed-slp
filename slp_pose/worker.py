@@ -82,7 +82,7 @@ class ChunkProcessor:
         size = (chunk.video.width, chunk.video.height)
         dets = detpost.detect(self._det_engine, self._det_post, chunk.letterbox,
                               prep.letterbox_geometry(*size).scale_factor, self._settings.det_batch)
-        rows, primary = select.select_chunk(dets, self._settings.max_posed, self._rule)
+        rows, primary = select.select_chunk(dets, self._settings.max_posed, self._rule, size)
         frame_idx = dets.frame_of_row()[rows]
         if len(rows):
             centers, scales = prep.crop_params(dets.boxes[rows])
@@ -117,7 +117,7 @@ class VideoTask:
 
     video: VideoInfo
     out_root: str               # absolute output root
-    primary_rule: str
+    primary_rule: str           # per-frame rule (select.PRIMARY_RULES) the video is extracted with
     allow_frame_mismatch: bool = False
     attempt: int = 1
 

@@ -1,17 +1,27 @@
-"""Run configuration: thresholds, batching, precision, model paths and the dataset registry.
+"""Run configuration: thresholds, batching, precision and model paths (datasets: slp_pose.datasets).
 
-Everything that changes GPU output is listed by `Settings.extraction_fields`; everything a CPU
+Everything that changes GPU output is listed by `Settings.extraction_fields` (plus the dataset's
+extraction rule when it changes which people are posed, record.extraction_hash); everything a CPU
 `derive` may change is listed by `Settings.derivation_fields` (spec §4.4).
+
+Settings objects are pickled to the GPU workers, and a respawned worker unpickles Settings made by
+the parent's (possibly older) code: fields are only ever added, each with a plain default (a
+missing field then reads the class default), and never renamed or removed.
 """
 from __future__ import annotations
 
 import dataclasses
-import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional, Tuple
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+from . import paths
+from .paths import REPO_ROOT
+
+DET_CONFIG = 'yolox_l_8xb8-300e_coco.py'           # in paths.CONFIG_DIR
+POSE_CONFIG = 'dwpose-l_384x288.py'
+DET_CHECKPOINT = 'yolox/yolox_l_8x8_300e_coco_20211126_140236-d3bd2b23.pth'   # in the models dir
+POSE_CHECKPOINT = 'dwpose/dw-ll_ucoco_384.pth'
 
 
 @dataclass(frozen=True)
@@ -32,7 +42,8 @@ BACKENDS = ('trt', 'torch')
 
 @dataclass(frozen=True)
 class Settings:
-    """Frozen run configuration. Paths are derived from `repo_root`; nothing is hardcoded."""
+    """Frozen run configuration. Nothing is hardcoded: configs ship with the package, checkpoints,
+    ONNX and engines live in `models_dir` (paths.models_dir() unless given)."""
 
     # Detection thresholds (spec D8). The head's own score_thr 0.01 / NMS 0.65 come from the
     # detector config (engines.DetMeta), not from here.
@@ -57,9 +68,12 @@ class Settings:
     # TensorRT optimisation profiles (min, opt, max batch); opt = the steady-state batch.
     det_profile: Tuple[int, int, int] = (1, 64, 64)
     pose_profile: Tuple[int, int, int] = (1, 256, 256)
-    repo_root: Path = REPO_ROOT
+    repo_root: Path = REPO_ROOT          # the source checkout: git sha in the provenance
+    # None (only in Settings pickled by older code): <repo_root>/models, as that code used.
+    models_root: Optional[Path] = None
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, 'models_root', paths.models_dir(self.models_root))
         if self.precision not in PRECISION_PROFILES:
             raise ValueError(f'unknown precision {self.precision!r}; known: {sorted(PRECISION_PROFILES)}')
         if self.backend not in BACKENDS:
@@ -81,26 +95,30 @@ class Settings:
     def profile(self) -> PrecisionProfile:
         return PRECISION_PROFILES[self.precision]
 
+    def as_json(self) -> Dict[str, object]:
+        """dataclasses.asdict with paths as str (provenance and reports)."""
+        return {k: str(v) if isinstance(v, Path) else v for k, v in dataclasses.asdict(self).items()}
+
     # ------------------------------------------------------------------ paths
     @property
     def models_dir(self) -> Path:
-        return self.repo_root / 'models'
+        return self.repo_root / 'models' if self.models_root is None else Path(self.models_root)
 
     @property
     def det_config(self) -> Path:
-        return self.models_dir / 'yolox' / 'yolox_l_8xb8-300e_coco.py'
+        return paths.CONFIG_DIR / DET_CONFIG
 
     @property
     def det_checkpoint(self) -> Path:
-        return self.models_dir / 'yolox' / 'yolox_l_8x8_300e_coco_20211126_140236-d3bd2b23.pth'
+        return self.models_dir / DET_CHECKPOINT
 
     @property
     def pose_config(self) -> Path:
-        return self.models_dir / 'dwpose' / 'dwpose-l_384x288.py'
+        return paths.CONFIG_DIR / POSE_CONFIG
 
     @property
     def pose_checkpoint(self) -> Path:
-        return self.models_dir / 'dwpose' / 'dw-ll_ucoco_384.pth'
+        return self.models_dir / POSE_CHECKPOINT
 
     @property
     def onnx_dir(self) -> Path:
@@ -121,54 +139,3 @@ class Settings:
         """Settings a CPU `derive` can change: the count rule and the primary rule."""
         return dict(count_score_thr=self.count_score_thr, count_nms_thr=self.count_nms_thr,
                     primary_rule=primary_rule)
-
-
-@dataclass(frozen=True)
-class DatasetSpec:
-    """One benchmark: where its videos are, where outputs go, how its signer is chosen.
-
-    Paths are relative to the repo root. The video id is the filename stem.
-    """
-
-    name: str
-    video_glob: str
-    out_root: str
-    primary_rule: str
-    split_file: Optional[str] = None
-    split_order: Tuple[str, ...] = ()
-
-    @staticmethod
-    def video_id(path: Path) -> str:
-        return Path(path).stem
-
-    def video_paths(self, repo_root: Path = REPO_ROOT) -> List[Path]:
-        """All videos of the dataset, sorted by path."""
-        return sorted(Path(repo_root).glob(self.video_glob))
-
-    def output_root(self, repo_root: Path = REPO_ROOT) -> Path:
-        return Path(repo_root) / self.out_root
-
-    def splits(self, repo_root: Path = REPO_ROOT) -> Dict[str, List[str]]:
-        """{split name: [video ids]} in `split_order`; empty when the dataset has no split file."""
-        if self.split_file is None:
-            return {}
-        with open(Path(repo_root) / self.split_file) as f:
-            raw = json.load(f)
-        unknown = set(raw) - set(self.split_order)
-        if unknown:
-            raise ValueError(f'{self.name}: splits {sorted(unknown)} missing from split_order')
-        return {name: [str(v) for v in raw[name]] for name in self.split_order if name in raw}
-
-
-DATASETS: Dict[str, DatasetSpec] = {
-    'bobsl': DatasetSpec(
-        name='bobsl',
-        video_glob='data/BOBSL/original_data/videos/mp4/*.mp4',
-        out_root='data/BOBSL/dwpose',
-        primary_rule='largest_bbox',
-        split_file='data/BOBSL/original_data/metadata/subset2episode.json',
-        split_order=('val', 'test', 'train', 'challenge_test'),
-    ),
-}
-# Development / pilot outputs for BOBSL (never the production root).
-BOBSL_DEV_ROOT = 'data/BOBSL/dwpose_dev'
