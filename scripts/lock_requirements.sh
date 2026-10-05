@@ -12,7 +12,7 @@
 # (cp38-cp311); numpy stays 1.x (so opencv-python resolves to 4.11.0.86, the last release allowing
 # numpy 1.x on Python >= 3.9). TensorRT stays 10.x: slp_pose/engines.py builds a weakly typed network
 # (create_network(0), TF32 flag cleared) and TensorRT 11.0 removed weak typing. setuptools stays < 82
-# (82 removed pkg_resources, which torch 2.1's cpp_extension, used by the mmcv rebuild, and mmengine import).
+# (82 removed pkg_resources, which mmengine imports).
 set -euo pipefail
 
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)

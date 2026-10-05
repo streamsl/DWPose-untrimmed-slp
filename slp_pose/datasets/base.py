@@ -5,7 +5,16 @@ examples/my_dataset.py). The subclass sets a `name`, optionally the signer rules
 order, and implements `videos()`. Everything else (checking ids, files, splits and rules,
 scheduling, the video index, extraction, derive, check, render) is the framework's job.
 
-Imports only the rule registries (select, signer: numpy), never torch.
+Extension point (spec D22): a rule that serves this dataset only is defined in its file and listed
+in `rules`, as a select.FrameRule (a per-frame rule the GPU workers can pose with) or a
+signer.VideoRule (a video-level rule that picks the final signer from the posed people, applied by
+`derive` on the CPU), built from scratch or from the framework's building blocks (select.py,
+signer.py). `primary_rule` and `extraction_rule` then name it; Dataset.rule resolves the
+dataset's names and the framework's generic ones (rules.py). Each rule's name and params are
+hashed, so changing a rule re-extracts (per-frame) or re-derives (video-level) the committed
+videos. examples/custom_rules.py and auslan_news.py are examples.
+
+Imports only the rules (select, signer, rules: numpy), never torch.
 """
 from __future__ import annotations
 
@@ -15,8 +24,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
-from ..select import PRIMARY_RULES
-from ..signer import VIDEO_RULES
+from ..rules import Rule, framework_names, framework_rule, is_framework_name
+from ..select import FrameRule
+from ..signer import VideoRule
 
 SAFE_ID = re.compile(r'[A-Za-z0-9._-]+')
 SEGMENT_SUFFIX = re.compile(r'_segment_\d+$')   # misaligned-slt names clips <video_id>_segment_<n>
@@ -51,11 +61,16 @@ class Dataset:
 
     Class attributes:
         name: registry and log name, [A-Za-z0-9._-]+; the default output root uses it.
-        primary_rule: the final signer rule behind poses/: per-frame (select.PRIMARY_RULES) or
-            video-level (signer.VIDEO_RULES, applied on the CPU right after each commit).
-        extraction_rule: the per-frame rule the GPU workers select and pose with; None means
-            primary_rule, which must then be per-frame. A video-level primary rule chooses among
-            the posed people, so pick an extraction rule that poses the signer.
+        primary_rule: name of the final signer rule behind poses/: per-frame or video-level
+            (applied on the CPU right after each commit); the framework's or one of `rules`.
+        extraction_rule: name of the per-frame rule the GPU workers select and pose with; None
+            means primary_rule, which must then be per-frame. A video-level primary rule chooses
+            among the posed people, so pick an extraction rule that poses the signer.
+        rules: the dataset's own rules (module docstring; D22), a tuple of select.FrameRule and
+            signer.VideoRule with distinct names [A-Za-z0-9._-]+ that are not the framework's
+            (largest_bbox, highest_score, signer_track). A per-frame rule of a dataset is resolved
+            again inside the spawned GPU workers, so define the dataset at module level of a .py
+            file, an importable module or an installed plugin (datasets.reference).
         split_order: when set, splits are extracted in this order (videos without a split last)
             and every Video.split must be one of them or None.
 
@@ -66,6 +81,7 @@ class Dataset:
     name: str = ''
     primary_rule: str = 'largest_bbox'
     extraction_rule: Optional[str] = None
+    rules: Tuple[Rule, ...] = ()
     split_order: Tuple[str, ...] = ()
 
     def __init__(self, data_root: os.PathLike) -> None:
@@ -80,6 +96,32 @@ class Dataset:
     def out_root(self) -> Path:
         """Default output root: <data root>/<name>/dwpose (override to put it elsewhere)."""
         return self.data_root / self.name / 'dwpose'
+
+    @classmethod
+    def rule(cls, name: str) -> Rule:
+        """The rule called `name`: one of the dataset's own `rules`, else the framework's (a
+        select.FrameRule or signer.VideoRule). KeyError for an unknown name."""
+        for own in cls.rules:
+            if own.name == name:
+                return own
+        try:
+            return framework_rule(name)
+        except KeyError:
+            raise KeyError(f'unknown rule {name!r} for the dataset {cls.name!r}; known: '
+                           f'{", ".join(cls.rule_names())}') from None
+
+    @classmethod
+    def frame_rule(cls, name: str) -> FrameRule:
+        """Dataset.rule for a per-frame rule (KeyError for a video-level one)."""
+        rule = cls.rule(name)
+        if not isinstance(rule, FrameRule):
+            raise KeyError(f'{name!r} is a video-level rule, not a per-frame rule')
+        return rule
+
+    @classmethod
+    def rule_names(cls) -> List[str]:
+        """Every rule name the dataset can use: the framework's, then its own."""
+        return framework_names() + [own.name for own in cls.rules]
 
     def __repr__(self) -> str:
         return f'{type(self).__name__}(name={self.name!r}, data_root={str(self.data_root)!r})'
@@ -99,18 +141,40 @@ def check_dataset_class(cls: type) -> None:
     where = f'{cls.__module__}.{cls.__qualname__}'
     if not isinstance(cls.name, str) or not SAFE_ID.fullmatch(cls.name):
         raise DatasetError(f'{where}: name {cls.name!r} must match {SAFE_ID.pattern}')
-    if cls.primary_rule not in PRIMARY_RULES and cls.primary_rule not in VIDEO_RULES:
+    _check_own_rules(cls)
+    rules = {name: cls.rule(name) for name in cls.rule_names()}
+    frame = sorted(name for name, rule in rules.items() if isinstance(rule, FrameRule))
+    video = sorted(name for name, rule in rules.items() if isinstance(rule, VideoRule))
+    if not isinstance(cls.primary_rule, str) or cls.primary_rule not in rules:
         raise DatasetError(f'{cls.name}: unknown primary_rule {cls.primary_rule!r}; per-frame rules '
-                           f'{sorted(PRIMARY_RULES)}, video-level rules {sorted(VIDEO_RULES)}')
+                           f'{frame}, video-level rules {video}')
     posing = cls.extraction_rule or cls.primary_rule
-    if posing not in PRIMARY_RULES:
+    if posing not in frame:
         hint = ' (a video-level primary_rule needs a per-frame extraction_rule)' if cls.extraction_rule is None else ''
-        raise DatasetError(f'{cls.name}: extraction rule {posing!r} is not a per-frame rule '
-                           f'{sorted(PRIMARY_RULES)}{hint}')
+        raise DatasetError(f'{cls.name}: extraction rule {posing!r} is not a per-frame rule {frame}{hint}')
     order = cls.split_order
     distinct = isinstance(order, tuple) and len(set(order)) == len(order)
     if not distinct or not all(isinstance(s, str) and s for s in order):
         raise DatasetError(f'{cls.name}: split_order must be a tuple of distinct non-empty str, got {order!r}')
+
+
+def _check_own_rules(cls: type) -> None:
+    """The class's `rules`: a tuple of FrameRule / VideoRule with distinct, safe names that are not
+    the framework's."""
+    own = cls.rules
+    if not isinstance(own, tuple) or not all(isinstance(rule, (FrameRule, VideoRule)) for rule in own):
+        raise DatasetError(f'{cls.name}: rules must be a tuple of FrameRule / VideoRule, got {own!r}')
+    names = [rule.name for rule in own]
+    bad = [name for name in names if not SAFE_ID.fullmatch(name)]
+    if bad:
+        raise DatasetError(f'{cls.name}: rule names {bad} must match {SAFE_ID.pattern}')
+    twice = sorted({name for name in names if names.count(name) > 1})
+    if twice:
+        raise DatasetError(f'{cls.name}: rule names {twice} are used more than once')
+    taken = sorted(name for name in names if is_framework_name(name))
+    if taken:
+        raise DatasetError(f"{cls.name}: rules {taken} reuse the names of the framework's rules; give them "
+                           f'names of their own')
 
 
 def load_videos(dataset: Dataset) -> List[Video]:

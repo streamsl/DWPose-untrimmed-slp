@@ -63,7 +63,7 @@ import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
@@ -75,6 +75,7 @@ if TYPE_CHECKING:
     import torch
 
     from .engines import PoseMeta
+    from .select import FrameRule
 
 PARTS: Dict[str, slice] = {'all': slice(0, 133), 'body': slice(0, 17), 'feet': slice(17, 23),
                            'face': slice(23, 91), 'lhand': slice(91, 112), 'rhand': slice(112, 133)}
@@ -94,7 +95,7 @@ JITTER_VARIANTS = ('batched_det', 'tf32')
 GATE_JITTER = 'batched_det'   # the baseline the jitter-relative limits scale (tf32 is lower precision, not noise)
 
 Plan = List[Tuple[VideoInfo, List[Tuple[int, int]]]]
-Rule = Callable[[np.ndarray, np.ndarray, Optional[Tuple[int, int]]], int]   # select.PRIMARY_RULES
+Rule = Callable[[np.ndarray, np.ndarray, Optional[Tuple[int, int]]], int]   # a select.FrameRule
 
 
 @dataclass(frozen=True)
@@ -178,6 +179,7 @@ class ParityModels:
     det_engine: object      # engines.load_engines for settings.backend
     pose_engine: object
     device: torch.device
+    official_nms: str = 'mmcv'   # 'detpost.head_nms' where mmcv's CUDA nms has no code for the GPU
 
 
 # --------------------------------------------------------------------------- one frame, both sides
@@ -217,7 +219,8 @@ def official_frame(det_model, pose_model, frame, settings: Settings = Settings()
                 pose_index=pose, count_index=count)
 
 
-def as_ours(official: Dict[str, object], frame_size: Tuple[int, int], k: int, rule: str) -> Dict[str, object]:
+def as_ours(official: Dict[str, object], frame_size: Tuple[int, int], k: int,
+            rule: Union[str, FrameRule]) -> Dict[str, object]:
     """An official_frame result in our_frame form: rows = its person detections, the posed rows and
     primary chosen by select.select_frame with the per-frame `rule` (as ours), keypoints in the saved
     encoding."""
@@ -340,7 +343,7 @@ def _quantile(hist: np.ndarray, q: float, maximum: float) -> float:
 class ParityAccumulator:
     """Folds per-frame comparisons (official_frame vs our_frame) into the ParityReport numbers.
 
-    `rule` is the per-frame extraction rule (select.PRIMARY_RULES[...]) applied to the official
+    `rule` is the per-frame extraction rule (a select.FrameRule: Dataset.frame_rule) applied to the official
     pose set; it is called as rule(boxes, scores, frame_size). `pose_meta` (engines.pose_meta) gives
     the pose input size and SimCC split ratio of the step (simcc_steps).
     """
@@ -600,6 +603,38 @@ def plan_windows(dataset: Dataset, num_videos: int = 20, windows: int = 3,
 
 
 # --------------------------------------------------------------------------- the run
+class _HeadNmsExt:
+    """mmcv's compiled ops module, except that nms of CUDA boxes runs detpost.head_nms (D27)."""
+
+    def __init__(self, ext) -> None:
+        self._ext = ext
+
+    def __getattr__(self, name: str):
+        return getattr(self._ext, name)
+
+    def nms(self, boxes, scores, iou_threshold: float, offset: int):
+        if not boxes.is_cuda or offset != 0:
+            return self._ext.nms(boxes, scores, iou_threshold=iou_threshold, offset=offset)
+        from .detpost import head_nms
+        return head_nms(boxes, scores, [len(boxes)], iou_threshold)[0]
+
+
+def official_nms(device) -> str:
+    """Make the official path's mmcv nms runnable on `device`: where mmcv's own CUDA kernel runs, leave
+    it ('mmcv'); where it cannot (its prebuilt ops stop at sm_86, so an H100 has none), route mmcv's
+    nms of CUDA boxes to detpost.head_nms, the same computation bit for bit ('detpost.head_nms')."""
+    import importlib
+    import torch
+    from .detpost import mmcv_nms_runs
+    module = importlib.import_module('mmcv.ops.nms')
+    if isinstance(module.ext_module, _HeadNmsExt):
+        return 'detpost.head_nms'
+    if mmcv_nms_runs(torch.device(device)):
+        return 'mmcv'
+    module.ext_module = _HeadNmsExt(module.ext_module)
+    return 'detpost.head_nms'
+
+
 def load_models(settings: Settings, device=None) -> ParityModels:
     """Official models and our engines (settings.backend) on `device` (default: the current CUDA
     device, cuda:0 under CUDA_VISIBLE_DEVICES), with TF32 off."""
@@ -609,7 +644,7 @@ def load_models(settings: Settings, device=None) -> ParityModels:
     device = torch.device('cuda', torch.cuda.current_device()) if device is None else torch.device(device)
     det_engine, pose_engine = engines.load_engines(settings, device)
     return ParityModels(engines.build_detector(settings, device), engines.build_pose_model(settings, device),
-                        det_engine, pose_engine, device)
+                        det_engine, pose_engine, device, official_nms(device))
 
 
 def _provenance(settings: Settings, device) -> Dict[str, object]:
@@ -635,7 +670,7 @@ def run_parity(settings: Settings, dataset: Dataset, num_videos: int = 20, windo
     go to report.jitter, where GATE_JITTER sets the gate's jitter-relative limits (gate_limits).
     """
     import torch
-    from . import engines, env, select
+    from . import engines, env
     from .render import FrameCursor
     from .video import chunk_frames, chunk_from_frames
     from .worker import ChunkProcessor
@@ -652,12 +687,12 @@ def run_parity(settings: Settings, dataset: Dataset, num_videos: int = 20, windo
     if (models.det_engine.backend, models.pose_engine.backend) != (settings.backend, settings.backend):
         raise ValueError(f'engines are {models.det_engine.backend}/{models.pose_engine.backend}, '
                          f'settings.backend is {settings.backend}')
-    rule = dataset.extraction_rule   # always per-frame (a video-level primary is a CPU derive)
+    rule = dataset.frame_rule(dataset.extraction_rule)   # always per-frame (a video-level primary is a CPU derive)
     pose_meta = engines.pose_meta(settings)
     thresholds = ParityThresholds()
     report = ParityReport(backend=settings.backend, videos=[v.video_id for v, _ in plan], windows=[],
-                          primary_rule=dataset.primary_rule, extraction_rule=rule,
-                          provenance=_provenance(settings, models.device),
+                          primary_rule=dataset.primary_rule, extraction_rule=rule.name,
+                          provenance=dict(_provenance(settings, models.device), official_nms=models.official_nms),
                           notes=['kp_p95_px / kp_p99_px are upper bounds from a log histogram (bins 2.3 % wide)',
                                  f'SimCC step = scale_h / ({pose_meta.input_size[1]} x '
                                  f'{pose_meta.simcc_split_ratio:g}) px with scale = prep.crop_params(official box); '
@@ -666,8 +701,8 @@ def run_parity(settings: Settings, dataset: Dataset, num_videos: int = 20, windo
                                  f'(any SimCC flip, <= {thresholds.max_kp_frac_flipped:g}), or up to '
                                  f'{thresholds.jitter_factor:g} x the {GATE_JITTER} jitter baseline; the px shares '
                                  'are informational'])
-    accumulator = ParityAccumulator(settings, select.PRIMARY_RULES[rule], pose_meta, thresholds)
-    jitter_accumulators = {name: ParityAccumulator(settings, select.PRIMARY_RULES[rule], pose_meta, thresholds)
+    accumulator = ParityAccumulator(settings, rule, pose_meta, thresholds)
+    jitter_accumulators = {name: ParityAccumulator(settings, rule, pose_meta, thresholds)
                            for name in jitter}
     jitter_seconds = dict.fromkeys(jitter, 0.0)
     processor = ChunkProcessor(settings, models.det_engine, models.pose_engine, engines.det_meta(settings),

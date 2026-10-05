@@ -26,8 +26,11 @@ from .video import VideoError, probe
 if TYPE_CHECKING:
     from .record import PersonsRecord
 
-# Inside the mmpose package: shipped by its wheel, linked to ../configs by an editable install.
-COCO_WHOLEBODY_METAINFO = Path('.mim') / 'configs' / '_base_' / 'datasets' / 'coco_wholebody.py'
+# mmpose's dataset metainfo, relative to the mmpose package directory: a wheel ships it under .mim/; an
+# editable install links .mim/configs to ../configs, a link some filesystems cannot follow (ntfs-3g reads
+# the ntfs3 driver's directory symlinks as 'unsupported reparse tag'), so the source tree is the fallback.
+COCO_WHOLEBODY_METAINFO = Path('configs') / '_base_' / 'datasets' / 'coco_wholebody.py'
+METAINFO_ROOTS = (Path('.mim'), Path('..'))
 # BGR colours of everything that is not the primary's skeleton.
 OTHER_COLOR = (170, 170, 170)        # other posed people: skeleton, box and detector score
 CANDIDATE_COLOR = (110, 110, 110)    # candidates that were not posed: thin boxes
@@ -47,12 +50,22 @@ class Skeleton:
     kpt_colors: Tuple[Tuple[int, int, int], ...]
 
 
+def coco_wholebody_metainfo_file() -> Path:
+    """mmpose's coco_wholebody.py: the first readable copy under METAINFO_ROOTS of the mmpose package."""
+    import mmpose
+    package = Path(mmpose.__file__).parent
+    for root in METAINFO_ROOTS:
+        path = package / root / COCO_WHOLEBODY_METAINFO
+        if path.is_file():
+            return path
+    raise FileNotFoundError(f'no readable coco_wholebody.py under {package} ({", ".join(map(str, METAINFO_ROOTS))})')
+
+
 @functools.lru_cache(maxsize=None)
 def coco_wholebody_skeleton() -> Skeleton:
     """Skeleton links and colours from mmpose's coco_wholebody.py (RGB there, as mmpose draws on RGB)."""
-    import mmpose
     from mmpose.datasets.datasets.utils import parse_pose_metainfo
-    meta = parse_pose_metainfo(dict(from_file=str(Path(mmpose.__file__).parent / COCO_WHOLEBODY_METAINFO)))
+    meta = parse_pose_metainfo(dict(from_file=str(coco_wholebody_metainfo_file())))
     if meta['num_keypoints'] != NUM_KEYPOINTS:
         raise ValueError(f"coco_wholebody metainfo has {meta['num_keypoints']} keypoints")
 

@@ -2,14 +2,16 @@
 
     python scripts/check_env.py                    # everything below; exit code 1 on any problem
     python scripts/check_env.py --arch 9.0         # also require CUDA code for compute capability 9.0
-    python scripts/check_env.py --covers 9.0 mmcv  # only: exit 0 iff mmcv's CUDA ops run on 9.0
+    python scripts/check_env.py --covers 9.0 mmcv  # only: exit 0 iff mmcv's CUDA ops run on 9.0 (informational)
 
 Checks: Python 3.11 or 3.8; installed versions equal that Python's pins (requirements.txt for 3.11,
 requirements-py38.txt for 3.8); the `slp_pose.env` start-up checks
 (pins, ./mmpose location when the checkout has one, TF32 off); onnx/onnxsim/onnxruntime import;
-ffmpeg with libx264 and ffprobe; the NVIDIA driver (>= 535 for TensorRT 10); CUDA code of torch,
-torchvision and mmcv for every GPU's compute capability (nvidia-smi) and `--arch`; and, when a GPU is
-visible, mmcv and torchvision NMS on it and a TensorRT builder.
+ffmpeg with libx264 and ffprobe; the NVIDIA driver (>= 535 for TensorRT 10); CUDA code of torch and
+torchvision for every GPU's compute capability (nvidia-smi) and `--arch`; and, when a GPU is visible,
+slp_pose's head NMS and torchvision's NMS on it (plus mmcv's, compared with ours, where mmcv has code
+for that GPU) and a TensorRT builder. mmcv's CUDA code is only reported: its prebuilt ops stop at sm_86,
+so an H100 has none, and there slp_pose does their one job, the detector NMS, with detpost.head_nms.
 
 A CUDA library runs on compute capability X.Y when its fatbinaries hold SASS for X.Z with Z <= Y,
 or PTX for an architecture <= X.Y (which the driver compiles when the library loads).
@@ -38,6 +40,7 @@ PTX, SASS = 1, 2   # fatbinary entry kinds
 CUDA_LIBRARIES = {'torch': ('torch', 'lib/libtorch_cuda.so'),
                   'torchvision': ('torchvision', '_C.so'),
                   'mmcv': ('mmcv', '_ext' + importlib.machinery.EXTENSION_SUFFIXES[0])}
+NEEDED_ON_GPU = ('torch', 'torchvision')   # where mmcv's CUDA nms cannot run, detpost.head_nms replaces it
 # the pinned environment of each supported Python
 REQUIREMENTS = {(3, 11): REPO_ROOT / 'requirements.txt', (3, 8): REPO_ROOT / 'requirements-py38.txt'}
 
@@ -181,9 +184,13 @@ def cuda_code_problems(capabilities: Sequence[str]) -> List[str]:
     problems = []
     for name in CUDA_LIBRARIES:
         entries = library_entries(library_path(name))
-        print(f'  {name}: {describe(entries)}')
-        problems += [f'{name} has no CUDA code for compute capability {c} (scripts/setup_env.sh rebuilds mmcv)'
-                     for c in capabilities if not runs_on(entries, c)]
+        missing = [c for c in capabilities if not runs_on(entries, c)]
+        if name in NEEDED_ON_GPU:
+            print(f'  {name}: {describe(entries)}')
+            problems += [f'{name} has no CUDA code for compute capability {c}' for c in missing]
+        else:
+            note = f' (none for {", ".join(missing)}: slp_pose uses detpost.head_nms there)' if missing else ''
+            print(f'  {name}: {describe(entries)}{note}')
     return problems
 
 
@@ -197,7 +204,9 @@ def gpu_problems() -> List[str]:
         return []
     import tensorrt
     import torchvision
-    from mmcv.ops import nms
+    sys.path.insert(0, str(REPO_ROOT))
+    from slp_pose.detpost import head_nms
+    mmcv_entries = library_entries(library_path('mmcv'))
     problems = []
     for i in range(torch.cuda.device_count()):
         major, minor = torch.cuda.get_device_capability(i)
@@ -205,13 +214,17 @@ def gpu_problems() -> List[str]:
         boxes = torch.tensor([[0., 0., 10., 10.], [1., 1., 11., 11.], [50., 50., 60., 60.]], device=f'cuda:{i}')
         scores = torch.tensor([0.9, 0.8, 0.7], device=f'cuda:{i}')
         try:
-            kept = sorted(nms(boxes, scores, 0.5)[1].tolist()), sorted(torchvision.ops.nms(boxes, scores, 0.5).tolist())
+            kept = {'slp_pose': head_nms(boxes, scores, [3], 0.5)[0].tolist(),
+                    'torchvision': torchvision.ops.nms(boxes, scores, 0.5).tolist()}
+            if runs_on(mmcv_entries, f'{major}.{minor}'):
+                from mmcv.ops import nms
+                kept['mmcv'] = nms(boxes, scores, 0.5)[1].tolist()
         except RuntimeError as e:
             problems.append(f'{label}: NMS failed: {e}')
             continue
-        if kept != ([0, 2], [0, 2]):
-            problems.append(f'{label}: NMS kept {kept}, expected [0, 2] from mmcv and torchvision')
-        print(f'  {label}: mmcv and torchvision NMS ran')
+        problems += [f'{label}: {name} NMS kept {rows}, expected [0, 2]'
+                     for name, rows in kept.items() if rows != [0, 2]]
+        print(f'  {label}: {", ".join(kept)} NMS ran')
     tensorrt.Builder(tensorrt.Logger(tensorrt.Logger.ERROR)).create_builder_config()
     print(f'  TensorRT {tensorrt.__version__} builder created')
     return problems

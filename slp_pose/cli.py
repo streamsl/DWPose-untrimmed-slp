@@ -24,18 +24,20 @@ Commands and options (argparse; defaults in brackets):
                  -> run.run_extract (workers use the dataset's extraction rule, the parent derives
                  its primary rule); exit code 0 iff every video was extracted or already done.
   derive         --dataset --out-root --videos ID... [all committed] --primary-rule R [dataset rule;
-                 per-frame or video-level] -> record.derive per video, then run.merge_meta (run.run_derive).
-  check          --dataset --out-root --videos ID... [all committed]
-                 -> record.check per video, plus record.derivation_problems (outputs not derived
-                 with the dataset's primary rule); prints problems and render commands for the
-                 suggested windows; exit code 1 on problems.
+                 per-frame or video-level, the framework's or the dataset's own: Dataset.rule]
+                 -> record.derive per video (the current meta row, D19), then run.merge_meta (run.run_derive).
+  check          --dataset --out-root --videos ID... [all committed] --no-crc
+                 -> record.check per video (rules resolved by the dataset; the CRC-32 of every persons/
+                 member unless --no-crc), plus record.derivation_problems
+                 (outputs not derived with the dataset's primary rule, count settings and current meta definitions);
+                 prints problems and render commands for the suggested windows; exit code 1 on problems.
   render         VIDEO_ID --dataset --out-root --start-s S [0] --duration-s S [30] | --full --persons
                  --out PATH [<out-root>/renders/<vid>_<start frame>.mp4, <vid>_full.mp4 with --full]
                  -> render.render_video.
   render-done    --dataset --out-root --vis-dir DIR [<out-root>_vis] --jobs N [3] --videos ID...
                  --limit N --follow --poll-s S [300] --no-persons
                  -> render_batch.render_committed (read-only on the output root; logs in <vis-dir>;
-                 one run per vis dir); exit code 0 iff no video failed.
+                 one run per vis dir); exit code 0 iff no video failed or was left unchecked mid-commit.
 Exit codes: 0 success; 1 failure (failed videos, check problems, parity gate, missing models);
 2 bad arguments (incl. an unknown or invalid dataset); 130 interrupted.
 """
@@ -54,9 +56,7 @@ from typing import Callable, Dict, List, Optional, Sequence
 from . import paths
 from .datasets import Dataset, DatasetError, load_videos, resolve
 from .env import configure_process
-from .select import PRIMARY_RULES
 from .settings import BACKENDS, Settings
-from .signer import VIDEO_RULES
 
 log = logging.getLogger('slp_pose')
 _SHOWN_WINDOWS = 5   # render suggestions printed per video by `check`
@@ -112,15 +112,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument('--allow-frame-mismatch', action='store_true',
                    help='accept a decoded frame count that differs from ffprobe nb_frames')
 
-    p = command('derive', 're-derive counts, primary and poses on the CPU')
+    p = command('derive', 're-derive counts, primary, poses and the meta row on the CPU')
     _out_root_option(p)
     p.add_argument('--videos', nargs='+', metavar='ID', help='[every committed video]')
-    p.add_argument('--primary-rule', choices=sorted(set(PRIMARY_RULES) | set(VIDEO_RULES)),
-                   help="per-frame or video-level rule [the dataset's primary rule]")
+    p.add_argument('--primary-rule', metavar='RULE',
+                   help="a per-frame or video-level rule, the framework's or the dataset's own [the dataset's "
+                        "primary rule]")
 
     p = command('check', 'verify committed outputs and flag primary switches')
     _out_root_option(p)
     p.add_argument('--videos', nargs='+', metavar='ID', help='[every committed video]')
+    p.add_argument('--no-crc', dest='verify_crc', action='store_false',
+                   help='skip the CRC-32 check of persons/ (one sequential read of each file)')
 
     p = command('render', 'draw the saved keypoints over a video window')
     p.add_argument('video_id', metavar='VIDEO_ID')
@@ -233,10 +236,11 @@ def _extract(args: argparse.Namespace) -> int:
 
 def _derive(args: argparse.Namespace) -> int:
     dataset, settings = _dataset(args), _settings(args)
+    rule = _rule(dataset, args.primary_rule or dataset.primary_rule)   # before anything is written
     root = _out_root(args, dataset)
     _setup_logging(root, 'derive')
     from .run import run_derive
-    derived, failed = run_derive(root, settings, args.primary_rule or dataset.primary_rule, args.videos)
+    derived, failed = run_derive(root, settings, rule, args.videos)
     log.info('derived %d videos, %d failed', len(derived), len(failed))
     return 1 if failed else 0
 
@@ -253,8 +257,9 @@ def _check(args: argparse.Namespace) -> int:
     bad = 0
     for vid in args.videos or committed_videos(root):
         try:
-            report = record.check(root, vid)
-            problems = report.problems + record.derivation_problems(root, vid, settings, dataset.primary_rule)
+            report = record.check(root, vid, dataset=dataset, verify_crc=args.verify_crc)
+            problems = report.problems + record.derivation_problems(root, vid, settings,
+                                                                    dataset.rule(dataset.primary_rule))
         except Exception as exc:
             log.error('%s: cannot check: %s: %s', vid, type(exc).__name__, exc)
             bad += 1
@@ -317,7 +322,7 @@ def _render_done(args: argparse.Namespace) -> int:
     summary = render_committed(root, vis_dir, _video_paths(dataset), jobs=args.jobs,
                                video_ids=args.videos, limit=args.limit, follow=args.follow,
                                persons=args.persons, poll_s=args.poll_s)
-    return 1 if summary.failed else 0
+    return 1 if summary.failed or summary.pending else 0
 
 
 _COMMANDS: Dict[str, Callable[[argparse.Namespace], int]] = {
@@ -360,6 +365,14 @@ def _positive(kind: Callable[[str], float]) -> Callable[[str], float]:
 
 def _dataset(args: argparse.Namespace) -> Dataset:
     return resolve(args.dataset, paths.data_root(args.data_root))
+
+
+def _rule(dataset: Dataset, name: str):
+    """dataset.rule(name); an unknown name is a DatasetError (exit code 2)."""
+    try:
+        return dataset.rule(name)
+    except KeyError as exc:
+        raise DatasetError(exc.args[0]) from None
 
 
 def _settings(args: argparse.Namespace, **changes) -> Settings:

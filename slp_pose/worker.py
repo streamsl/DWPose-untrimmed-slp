@@ -30,7 +30,7 @@ import traceback
 from concurrent.futures import Executor, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, ContextManager, Dict, Iterator, List, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, ContextManager, Dict, Iterator, List, Optional, Tuple, Union
 
 import numpy as np
 
@@ -40,6 +40,7 @@ from .types import NUM_KEYPOINTS, Chunk, ChunkDets, ChunkPoses, VideoInfo
 
 if TYPE_CHECKING:
     from .engines import DetMeta, PoseMeta
+    from .select import FrameRule
 
 HEARTBEAT_S = 15.0   # 'progress' interval; the parent's watchdog allows 10 minutes of silence
 EXIT_FATAL = 3
@@ -58,7 +59,7 @@ class ChunkProcessor:
     """
 
     def __init__(self, settings: Settings, det_engine, pose_engine, det_meta: DetMeta, pose_meta: PoseMeta,
-                 primary_rule: str, crop_pool: Optional[Executor] = None) -> None:
+                 primary_rule: Union[str, FrameRule], crop_pool: Optional[Executor] = None) -> None:
         from . import detpost, posepost
         self._settings = settings
         self._det_engine = det_engine
@@ -113,13 +114,35 @@ def _empty_poses(num_frames: int) -> ChunkPoses:
 
 @dataclass(frozen=True)
 class VideoTask:
-    """One unit of work sent by the parent to a worker (picklable)."""
+    """One unit of work sent by the parent to a worker (picklable).
+
+    A respawned worker unpickles VideoTasks made by the parent's (possibly older) code: fields are
+    only ever added at the end, each with a plain default (an older pickle then reads the class
+    default), and never renamed or removed (tests/test_pickle_compat.py).
+    """
 
     video: VideoInfo
     out_root: str               # absolute output root
-    primary_rule: str           # per-frame rule (select.PRIMARY_RULES) the video is extracted with
+    primary_rule: str           # name of the per-frame rule the video is extracted with (task_rule)
     allow_frame_mismatch: bool = False
     attempt: int = 1
+    # datasets.reference of the extracted dataset: the worker imports it to resolve a per-frame rule
+    # of the dataset's own (Dataset.rules, D22). None: the framework's rule, or a built-in
+    # dataset's (every task of a parent from before D22; task_rule).
+    dataset: Optional[str] = None
+
+
+def task_rule(task: VideoTask) -> FrameRule:
+    """The per-frame rule a task is extracted with: the framework's rule of that name, else the
+    dataset's own (task.dataset is imported in this process, as a spawned worker has not imported
+    it; datasets.dataset_class). A task without a dataset comes from a parent from before D22,
+    whose per-frame rules are now the framework's or a built-in dataset's own (rules.as_rule,
+    datasets.builtin_rule). KeyError for an unknown or video-level rule."""
+    from . import rules
+    if task.dataset is not None and not rules.is_framework_name(task.primary_rule):
+        from .datasets import dataset_class
+        return dataset_class(task.dataset).frame_rule(task.primary_rule)
+    return rules.as_frame_rule(task.primary_rule)
 
 
 @dataclass(frozen=True)
@@ -160,11 +183,12 @@ def is_gpu_error(exc: BaseException) -> bool:
 class Pipeline:
     """What the worker loop needs: a ChunkProcessor per primary rule, and the provenance.
 
-    `make_processor(rule)` builds a processor (anything with `process(chunk)`); processors and
-    provenance dicts are cached per rule.
+    `make_processor(rule)` builds a processor (anything with `process(chunk)`) for a FrameRule;
+    processors and provenance dicts are cached per rule. Rules are FrameRules or framework rule
+    names (select.frame_rule).
     """
 
-    def __init__(self, settings: Settings, make_processor: Callable[[str], object],
+    def __init__(self, settings: Settings, make_processor: Callable[[FrameRule], object],
                  model_provenance: Dict[str, object], gpu_name: str) -> None:
         from . import record
         self.settings = settings
@@ -172,16 +196,20 @@ class Pipeline:
         self.model_provenance = model_provenance
         self.extraction_hash = record.extraction_hash(settings, model_provenance)
         self._make_processor = make_processor
-        self._processors: Dict[str, object] = {}
-        self._provenance: Dict[str, Dict[str, object]] = {}
+        self._processors: Dict[FrameRule, object] = {}
+        self._provenance: Dict[FrameRule, Dict[str, object]] = {}
 
-    def processor(self, rule: str):
+    def processor(self, rule: Union[str, FrameRule]):
+        from .select import frame_rule
+        rule = frame_rule(rule)
         if rule not in self._processors:
             self._processors[rule] = self._make_processor(rule)
         return self._processors[rule]
 
-    def provenance(self, rule: str) -> Dict[str, object]:
+    def provenance(self, rule: Union[str, FrameRule]) -> Dict[str, object]:
         from . import record
+        from .select import frame_rule
+        rule = frame_rule(rule)
         if rule not in self._provenance:
             self._provenance[rule] = record.make_provenance(self.settings, rule, self.model_provenance,
                                                             self.gpu_name)
@@ -301,7 +329,8 @@ class _VideoLoop:
         self._send = send
         self._feed = feed
         self._stop = stop
-        self._task: Optional[VideoTask] = None   # video in progress, its spill and start time
+        self._task: Optional[VideoTask] = None   # video in progress, its rule, spill and start time
+        self._rule: Optional[FrameRule] = None
         self._spill = None
         self._t0 = 0.0
         self._dropped: set = set()               # failed videos whose remaining chunks are skipped
@@ -329,7 +358,7 @@ class _VideoLoop:
 
     def abort(self) -> None:
         """Drop the video in progress (stop request or fatal error); committed outputs are untouched."""
-        spill, self._spill, self._task = self._spill, None, None
+        spill, self._spill, self._task, self._rule = self._spill, None, None, None
         if spill is not None:
             spill.abort()
 
@@ -380,7 +409,7 @@ class _VideoLoop:
             if self._task is not task:
                 self._begin(task)
             if chunk.num_frames:
-                dets, poses = self._pipeline.processor(task.primary_rule).process(chunk)
+                dets, poses = self._pipeline.processor(self._rule).process(chunk)
                 self._spill.append(chunk.start, dets, poses)
                 self.frames += chunk.num_frames
             if chunk.last:
@@ -396,15 +425,16 @@ class _VideoLoop:
         from . import record
         if self._task is not None:   # the reader always ends a video first; never leave one open
             self._fail(self._task, 'a new video started before this one ended', '')
-        self._spill = record.SpillWriter(Path(task.out_root), task.video, task.primary_rule)
-        self._task, self._t0, self.frames = task, time.time(), 0
+        rule = task_rule(task)
+        self._spill = record.SpillWriter(Path(task.out_root), task.video, rule)
+        self._task, self._rule, self._t0, self.frames = task, rule, time.time(), 0
         self._send('started', task.video.video_id, payload={'attempt': task.attempt})
 
     def _commit(self) -> None:
         task = self._task
-        info = self._spill.finalize(self._settings, self._pipeline.provenance(task.primary_rule))
+        info = self._spill.finalize(self._settings, self._pipeline.provenance(self._rule))
         seconds = self.seconds
-        self._task = self._spill = None
+        self._task = self._spill = self._rule = None
         self._feed.finish(task.video.video_id)
         self.activity += 1
         self._send('done', task.video.video_id, info.num_frames, seconds, dataclasses.asdict(info))

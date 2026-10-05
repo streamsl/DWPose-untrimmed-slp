@@ -13,25 +13,20 @@
 #      slp_pose.env requires then.
 #   4. deletes TensorRT's Windows-only builder resources (1.8 GB in 10.13, 2.9 GB in 10.16; they serve
 #      engines built for Windows only); `import tensorrt` comes from the tensorrt-cu12 sdist, no shim
-#   5. rebuilds mmcv's CUDA ops when the prebuilt wheel has no code for a GPU (it stops at sm_86, so an
-#      H100 = compute capability 9.0 needs it; needs a CUDA 12.x nvcc and a host compiler it supports)
-#   6. installs this checkout editable with its [trt] extra (`slp-pose` command)
-#   7. pip check + scripts/check_env.py (imports, versions, ffmpeg, CUDA code for every GPU, GPU kernels)
+#   5. installs this checkout editable with its [trt] extra (`slp-pose` command)
+#   6. pip check + scripts/check_env.py (imports, versions, ffmpeg, CUDA code for every GPU, GPU kernels)
+# No CUDA toolkit is needed on any GPU, H100 (compute capability 9.0) included: the prebuilt mmcv's CUDA
+# ops stop at sm_86, and where they cannot run slp_pose does their one job, the detector NMS, in torch.
 # Each step skips what is already done, so after a failure fix the cause and re-run. It refuses to
 # touch a venv it did not create.
 #
 # Environment:
 #   PYTHON          interpreter for the new venv (must be the chosen Python version)
-#   MMCV_CUDA_ARCH  compute capabilities for step 5, e.g. 9.0 or "8.6;9.0" [the GPUs', from nvidia-smi]
-#   CUDA_HOME       CUDA 12.x toolkit for step 5 [/usr/local/cuda]
-#   MAX_JOBS        parallel compile jobs for step 5 [nproc]
 set -euo pipefail
 
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 VENV=$REPO/.venv
 PY_VERSION=3.11
-MMCV_SDIST='mmcv @ https://files.pythonhosted.org/packages/a7/19/f97f0fd4d432113a232e75f965335be6b7bb6557ae9faf8051e9a012cadd/mmcv-2.1.0.tar.gz#sha256=d387bcab66b467479b6660310e23746cfc79c6e57acf04094680adb499a5cd3f'
-NINJA='ninja==1.13.2 --hash=sha256:65a24341b5ac09fcadcc37082660be40a94174e51a937fabf6e2cae26225fa2c'
 MARKER=.created-by-slp-pose-setup
 
 die() { echo "setup_env: ERROR: $*" >&2; exit 1; }
@@ -81,7 +76,7 @@ case $PY_VERSION in
 esac
 START=$(date +%s)
 
-step '1/7 system'
+step '1/6 system'
 [ "$(uname -s)-$(uname -m)" = Linux-x86_64 ] || die 'needs Linux x86_64'
 # (Command outputs are captured before grep: with pipefail, a reader that stops early would fail the
 # pipeline through SIGPIPE.)
@@ -96,7 +91,7 @@ grep -q libx264 <<< "$ENCODERS" || die 'ffmpeg has no libx264 encoder'
 FFMPEG=$(ffmpeg -version)
 echo "glibc $GLIBC, ${FFMPEG%%Copyright*}"
 
-step "2/7 venv $VENV (Python $PY_VERSION)"
+step "2/6 venv $VENV (Python $PY_VERSION)"
 if [ -e "$VENV" ]; then
     [ -f "$VENV/$MARKER" ] || die "$VENV exists but was not created by this script; delete it or pass --venv NEW_DIR"
 else
@@ -117,7 +112,7 @@ mkdir -p "$TMPDIR"
 trap 'rm -rf "$VENV/.tmp"' EXIT
 pip_q() { "$VPY" -m pip -q "$@"; }
 
-step "3/7 $(basename "$REQUIREMENTS")"
+step "3/6 $(basename "$REQUIREMENTS")"
 if [ -d "$REPO/mmpose/mmpose" ]; then
     # Like `pip install -e ./mmpose` without writing into ./mmpose: the path makes its package and its
     # mmpose.egg-info (the installed version for pip) visible, so the pinned mmpose counts as installed.
@@ -130,39 +125,12 @@ pins_of "$REQUIREMENTS" 'pip setuptools wheel' > "$TMPDIR/build-tools.txt"
 pip_q install --require-hashes --no-deps -r "$TMPDIR/build-tools.txt"
 pip_q install --require-hashes --no-deps --no-build-isolation -r "$REQUIREMENTS"
 
-step '4/7 TensorRT'
+step '4/6 TensorRT'
 # 10.13: libnvinfer_builder_resource_win.so.*; 10.16: libnvinfer_builder_resource_win_{ptx,sm75,...}.so.*
 rm -f "$SITE"/tensorrt_libs/libnvinfer_builder_resource_win*.so.*
 "$VPY" -I -c 'import tensorrt; print("tensorrt", tensorrt.__version__)'
 
-step '5/7 mmcv CUDA ops'
-ARCH=${MMCV_CUDA_ARCH:-}
-if [ -z "$ARCH" ] && command -v nvidia-smi > /dev/null; then
-    ARCH=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2> /dev/null | sort -u | paste -sd';' - || true)
-fi
-if [ -z "$ARCH" ]; then
-    echo 'no GPU found and MMCV_CUDA_ARCH unset: skipped (re-run this script on the GPU machine)'
-elif "$VPY" "$REPO/scripts/check_env.py" --covers "$ARCH" mmcv; then
-    echo "mmcv's CUDA ops run on compute capability $ARCH"
-else
-    CUDA=${CUDA_HOME:-/usr/local/cuda}
-    [ -x "$CUDA/bin/nvcc" ] || die "mmcv must be rebuilt for compute capability $ARCH, but $CUDA/bin/nvcc is missing:
-install a CUDA 12.x toolkit (see README) and set CUDA_HOME"
-    NVCC=$("$CUDA/bin/nvcc" --version)
-    grep -q 'release 12\.' <<< "$NVCC" ||
-        die "$CUDA/bin/nvcc is not CUDA 12.x (torch 2.1.2 is built with CUDA 12.1; set CUDA_HOME)"
-    echo "building mmcv 2.1.0 for $ARCH with $(grep release <<< "$NVCC") (10-30 min)"
-    echo "$NINJA" > "$TMPDIR/ninja.txt"
-    pip_q install --require-hashes --no-deps -r "$TMPDIR/ninja.txt"
-    # --no-cache-dir: pip's wheel cache does not know TORCH_CUDA_ARCH_LIST.
-    PATH=$VENV/bin:$CUDA/bin:$PATH CUDA_HOME=$CUDA MMCV_WITH_OPS=1 FORCE_CUDA=1 TORCH_CUDA_ARCH_LIST=$ARCH \
-        MAX_JOBS=${MAX_JOBS:-$(nproc)} \
-        "$VPY" -m pip install -q --no-deps --no-build-isolation --no-cache-dir --force-reinstall "$MMCV_SDIST"
-    pip_q uninstall -y ninja
-    "$VPY" "$REPO/scripts/check_env.py" --covers "$ARCH" mmcv || die "the rebuilt mmcv has no code for $ARCH"
-fi
-
-step '6/7 slp-pose[trt] (editable)'
+step '5/6 slp-pose[trt] (editable)'
 if ! "$VPY" -I - "$REPO" << 'EOF'
 import json, sys
 from importlib import metadata
@@ -185,7 +153,7 @@ then
 fi
 "$VENV/bin/slp-pose" --help > /dev/null
 
-step '7/7 checks'
+step '6/6 checks'
 "$VPY" -m pip check
-(cd "$REPO" && "$VPY" scripts/check_env.py ${MMCV_CUDA_ARCH:+--arch "$MMCV_CUDA_ARCH"})
+(cd "$REPO" && "$VPY" scripts/check_env.py)
 echo "setup_env: done in $(( $(date +%s) - START )) s"

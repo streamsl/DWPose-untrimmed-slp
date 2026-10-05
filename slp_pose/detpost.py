@@ -2,8 +2,9 @@
 
 Reproduces `YOLOXHead.predict_by_feat(rescale=True)` restricted to the person class, batched on
 the GPU, then splits the result into the three box sets of spec §4.1:
-- candidates: person, score > cand_score_thr, after the head's class-aware NMS 0.65 (mmcv nms on
-  the GPU, per frame, exactly as mmdet's batched_nms sees the person boxes);
+- candidates: person, score > cand_score_thr, after the head's class-aware NMS 0.65 (mmcv's CUDA nms,
+  per frame, exactly as mmdet's batched_nms sees the person boxes; on a GPU that mmcv's prebuilt
+  kernels do not cover, e.g. an H100, the same computation bit for bit in torch, `head_nms`, D27);
 - pose set (POSE_SET): candidates with score > pose_score_thr after mmpose's numpy `nms`
   (legacy +1 IoU), the DWPose reference rule;
 - count set (COUNT_SET): candidates with score > count_score_thr after torchvision `nms` on the CPU
@@ -38,6 +39,121 @@ def decode_boxes(priors: torch.Tensor, bbox_preds: torch.Tensor) -> torch.Tensor
     br_x = (xys[..., 0] + whs[..., 0] / 2)
     br_y = (xys[..., 1] + whs[..., 1] / 2)
     return torch.stack([tl_x, tl_y, br_x, br_y], -1)
+
+
+_FLT_TIE = 2.0 ** 128 - 2.0 ** 103   # halfway between FLT_MAX and 2^128: sums from here round to inf
+_NMS_CELLS = 1 << 22                 # box pairs per overlap pass (~0.35 GB of temporaries at most)
+
+
+def fma32(x: torch.Tensor, y: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+    """float32 fma(x, y, z) with one rounding, from float64: x*y is exact there, and where the float64
+    sum lands exactly halfway between two float32 values (or at the overflow tie _FLT_TIE), its exact
+    error (TwoSum) picks the side."""
+    p, zz = x.double() * y.double(), z.double()
+    s = p + zz
+    t = s - zz
+    err = (p - t) + (zz - (s - t))                  # p + zz == s + err exactly
+    r = s.float()
+    up = s > r.double()
+    other = torch.nextafter(r, torch.where(up, r.new_tensor(float('inf')), r.new_tensor(float('-inf'))))
+    halfway = torch.where(r.isinf(), s.abs() == _FLT_TIE, (r.double() + other.double()) * 0.5 == s)
+    return torch.where(halfway & (err != 0) & ((err > 0) == up) & s.isfinite(), other, r)
+
+
+def _suppressed(boxes: torch.Tensor, rows: torch.Tensor, cols: torch.Tensor, iou_thr: float) -> np.ndarray:
+    """(F, R, C) bool on the CPU: box cols[f, j] overlaps box rows[f, i] above iou_thr by mmcv's float32
+    test, rows being the higher-ranked boxes: interS > thr * (fma(width_b, height_b, Sa) - interS)."""
+    ax1, ay1, ax2, ay2 = boxes[rows].unbind(-1)
+    bx1, by1, bx2, by2 = boxes[cols].unbind(-1)
+    w = (torch.minimum(ax2[:, :, None], bx2[:, None]) - torch.maximum(ax1[:, :, None], bx1[:, None])).clamp(min=0)
+    h = (torch.minimum(ay2[:, :, None], by2[:, None]) - torch.maximum(ay1[:, :, None], by1[:, None])).clamp(min=0)
+    inter = w * h
+    bw, bh = bx2 - bx1, by2 - by1
+    both = fma32(bw[:, None].expand_as(inter), bh[:, None].expand_as(inter),
+                 ((ax2 - ax1) * (ay2 - ay1))[:, :, None].expand_as(inter))
+    return (inter > boxes.new_tensor(iou_thr) * (both - inter)).cpu().numpy()
+
+
+def head_nms(boxes: torch.Tensor, scores: torch.Tensor, counts: Sequence[int],
+             iou_thr: float) -> Tuple[torch.Tensor, List[int]]:
+    """(rows kept, kept per frame) by mmcv.ops.nms(boxes_f, scores_f, iou_thr) of every frame f with
+    >= 2 rows (a frame with fewer keeps them): rows grouped by frame (`counts` per frame, in order);
+    the kept rows frame after frame, each frame's by descending score, as mmcv returns them.
+
+    mmcv 2.1.0's CUDA nms recomputed in plain torch, so that no compiled mmcv code is needed for the GPU
+    (its wheel has none for compute capability 9.0): torch's descending sort of the frame's scores (the
+    same call, so equal scores keep the same order), the same float32 test of a higher-ranked box a
+    against a lower-ranked box b, interS > thr * (Sa + Sb - interS), with Sa + Sb fused into
+    fma(width_b, height_b, Sa) as nvcc compiled it (measured: the one contraction that reproduces mmcv
+    on near-ties), and the same greedy pass down the ranking. Frames of similar size share an overlap
+    pass of at most _NMS_CELLS box pairs, and a frame too big for one pass is done in row blocks, so a
+    crowded frame needs no more GPU memory than that."""
+    device = boxes.device
+    bounds = np.concatenate([[0], np.cumsum(counts, dtype=np.int64)])
+    multi = [f for f, n in enumerate(counts) if n >= 2]
+    ranked = [scores[bounds[f]:bounds[f + 1]].sort(0, descending=True)[1] for f in multi]
+    orders = dict(zip(multi, np.split(torch.cat(ranked).cpu().numpy(), np.cumsum([counts[f] for f in multi])[:-1])
+                      if multi else []))
+    keep: Dict[int, np.ndarray] = {}
+    groups: List[List[int]] = []
+    for f in sorted(multi, key=lambda f: counts[f]):
+        if groups and (len(groups[-1]) + 1) * counts[f] ** 2 <= _NMS_CELLS:
+            groups[-1].append(f)
+        else:
+            groups.append([f])
+    for group in groups:
+        width = counts[group[-1]]
+        index = np.zeros((len(group), width), np.int64)
+        for i, f in enumerate(group):
+            index[i, :counts[f]] = orders[f] + bounds[f]
+        index_t = torch.from_numpy(index).to(device)
+        step = max(1, _NMS_CELLS // (len(group) * width))
+        over = np.concatenate([_suppressed(boxes, index_t[:, r:r + step], index_t, iou_thr)
+                               for r in range(0, width, step)], axis=1)
+        for i, f in enumerate(group):
+            alive, kept, r = np.ones(counts[f], bool), [], 0
+            while True:                                  # greedy: from each kept box to the next survivor
+                kept.append(r)
+                alive &= ~over[i, r, :counts[f]]
+                later = np.flatnonzero(alive[r + 1:])
+                if not len(later):
+                    break
+                r += 1 + later[0]
+            keep[f] = orders[f][kept] + bounds[f]
+    rows = [keep[f] if f in keep else np.arange(bounds[f], bounds[f + 1]) for f in range(len(counts))]
+    return (torch.from_numpy(np.concatenate(rows) if rows else np.zeros(0, np.int64)).to(device),
+            [len(r) for r in rows])
+
+
+_MMCV_NMS_RUNS: Dict[int, bool] = {}
+
+
+def mmcv_nms_runs(device: torch.device) -> bool:
+    """Whether mmcv's compiled CUDA nms runs on `device` (one probe per device index): its prebuilt ops
+    stop at sm_86 with no PTX, so on an H100 (compute capability 9.0) it raises 'no kernel image'."""
+    if device.index not in _MMCV_NMS_RUNS:
+        from mmcv.ops import nms
+        boxes = torch.tensor([[0., 0., 10., 10.], [1., 1., 11., 11.]], device=device)
+        try:
+            nms(boxes, torch.tensor([0.9, 0.8], device=device), 0.5)
+            _MMCV_NMS_RUNS[device.index] = True
+        except RuntimeError:   # 'no kernel image is available' (not sticky) or a CPU-only mmcv build
+            _MMCV_NMS_RUNS[device.index] = False
+    return _MMCV_NMS_RUNS[device.index]
+
+
+def mmcv_head_nms(boxes: torch.Tensor, scores: torch.Tensor, counts: Sequence[int],
+                  iou_thr: float) -> Tuple[torch.Tensor, List[int]]:
+    """head_nms with mmcv's own CUDA kernel, one call per frame (identical results; about 3x faster on
+    crowded frames than head_nms on GPUs with slow float64, so it is used wherever it runs)."""
+    from mmcv.ops import nms
+    pieces, start = [], 0
+    for n in counts:
+        pieces.append(nms(boxes[start:start + n], scores[start:start + n], iou_thr)[1] + start if n >= 2
+                      else torch.arange(start, start + n, device=boxes.device))
+        start += n
+    sel = torch.cat(pieces) if pieces else torch.empty(0, dtype=torch.long, device=boxes.device)
+    return sel, [len(p) for p in pieces]
 
 
 def pose_set_mask(boxes: np.ndarray, scores: np.ndarray, score_thr: float, nms_thr: float) -> np.ndarray:
@@ -91,7 +207,6 @@ class DetPostprocessor:
 
     def __call__(self, maps: Sequence[torch.Tensor], scale_factor: Tuple[float, float]) -> ChunkDets:
         """maps: the 9 engine outputs for B frames; scale_factor: mmdet (w_scale, h_scale)."""
-        from mmcv.ops import nms
         cls_maps, box_maps, obj_maps = maps[0:3], maps[3:6], maps[6:9]
         b, c = cls_maps[0].shape[:2]
         cls = torch.cat([m.permute(0, 2, 3, 1).reshape(b, -1, c) for m in cls_maps], 1).sigmoid()
@@ -105,19 +220,8 @@ class DetPostprocessor:
         cand_scores = scores[frame, prior]
 
         # Head NMS per frame; nonzero() keeps frames contiguous and in order.
-        pieces: List[torch.Tensor] = []
-        kept: List[int] = []
-        start = 0
-        everything = torch.arange(len(cand_scores), device=cand_scores.device)
-        for n in torch.bincount(frame, minlength=b).tolist():
-            if n >= 2:
-                _, keep = nms(cand_boxes[start:start + n], cand_scores[start:start + n], self._nms_iou)
-                pieces.append(keep + start)
-            else:
-                pieces.append(everything[start:start + n])
-            kept.append(len(pieces[-1]))
-            start += n
-        sel = torch.cat(pieces)
+        nms = mmcv_head_nms if cand_boxes.is_cuda and mmcv_nms_runs(cand_boxes.device) else head_nms
+        sel, kept = nms(cand_boxes, cand_scores, torch.bincount(frame, minlength=b).tolist(), self._nms_iou)
         out_boxes = cand_boxes[sel].cpu().numpy()
         out_scores = cand_scores[sel].cpu().numpy()
         offsets = np.zeros(b + 1, np.int64)

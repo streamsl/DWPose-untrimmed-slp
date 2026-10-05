@@ -1,6 +1,7 @@
 """Per-video record: spill files, streamed poses .npy, persons .npz, commit, resume, derive, check.
 
-CPU only: imports select, signer, meta and env; detpost (which imports torch) only inside `derive`; never engines.
+CPU only: imports select, signer, rules, meta and env; detpost (which imports torch) only inside `derive`; never
+engines.
 
 Layout under an output root <root> (spec §4.1, §4.4):
   poses/<vid>.npy          (T,133,3) float32 C-order, npy format v1.0, primary signer only;
@@ -20,25 +21,44 @@ persons/<vid>.npz members (spec §4.1; numpy dtypes exact, 0-d arrays for scalar
   kpt_primary (T,) int8; primary_rule str 0-d; meta str 0-d (JSON row); provenance str 0-d (JSON).
 Invariants (PersonsRecord.problems, run at finalize and by `check`):
   poses[t] == kpts[kpt_offsets[t] + kpt_primary[t]] bit-for-bit, zeros when kpt_primary[t] == -1;
-  kpt_primary is what `primary_rule` picks: for a per-frame rule (select.PRIMARY_RULES) the pick
+  kpt_primary is what `primary_rule` picks: for a per-frame rule (select.FrameRule) the pick
   on the frame's pose set, so kpt_primary[t] == -1 exactly where the frame has no POSE_SET row
   (equivalently num_persons[t] == 0 while count_score_thr == pose_score_thr); for a video-level
-  rule (signer.VIDEO_RULES) the rule's choice among the posed rows of the whole video, which may
-  also be -1 where the pose set is not empty (no signer on screen);
+  rule (signer.VideoRule) the rule's choice among the posed rows of the whole video (it sees
+  signer.PosedPeople: their boxes, scores and keypoints), which may also be -1 where the pose set
+  is not empty (no signer on screen). The rule is the framework's of that name, or a dataset's own
+  (Dataset.rules, D22): functions that apply or check a rule take the rule object (Dataset.rule)
+  or a framework rule's name, and `check` takes the dataset;
   num_persons[t] == number of COUNT_SET rows of frame t;
   kpt_det rows of frame t are exactly its POSED rows, ascending; POSED implies POSE_SET; det rows
   within a frame have non-increasing scores. Also checked: dtypes, shapes and CSR indices, and
   `meta` is the row computed from the record (poses/ and the meta row are pure functions of the
-  record). Extraction commits with a per-frame rule; a video-level rule comes from `derive`.
+  record) under the definitions its provenance['meta_version'] names: meta.META_VERSION = the
+  current row (meta.meta_row; a video-level rule's candidates are the people in its region,
+  signer.SignerChoice.region), absent = the legacy whole-frame row (meta.legacy_meta_row).
+  Extraction commits with a per-frame rule and the legacy whole-frame row (meta_version absent,
+  commit_derivation_hash); `derive` writes the current row, so the parent derives every commit
+  (its derivation_hash is never the target derivation_hash) and an outdated record is re-derived
+  by `derive` and by the next `extract`. A record derived under another meta_version (by older
+  code, whose rules may pick otherwise) is reported in one line, without its picks and meta row
+  checked, until it is re-derived.
 Commit (finalize and derive): every file is staged and fsynced in .work/<vid>/, then os.replace
   persons/<vid>.npz -> poses/<vid>.npy -> .state/meta/<vid>.json, fsync those directories, then
   os.replace .state/done/<vid>.json and fsync its directory, so a done marker always describes
-  complete files. finalize first deletes an older done marker of the video (a crash mid-commit
-  then reads as 'extract'); derive keeps it, so a hard crash (SIGKILL, power loss) mid-derive
-  reads as 'derive' again only while the persons file still has the size the old marker records:
-  a derive that changes that size (the meta JSON inside it can change length) and dies after
-  replacing persons/ but before the marker reads as 'extract' (a GPU re-extraction; nothing is
-  lost). Ctrl-C and SIGTERM never cut a derive short (run.deferred_interrupt).
+  complete files. derive stages and replaces poses/<vid>.npy only when its bytes change: a
+  committed poses file that already holds the derived rows bit for bit (e.g. a derive that changes
+  only the meta row) is read, never rewritten. finalize first deletes an older done marker of the
+  video (a crash mid-commit then reads as 'extract'); derive keeps it, so a hard crash (SIGKILL,
+  power loss) mid-derive reads as 'derive' again only while the persons file still has the size
+  the old marker records: a derive that changes that size (the meta JSON inside it can change
+  length) and dies after replacing persons/ but before the marker reads as 'extract' (a GPU
+  re-extraction; nothing is lost). Ctrl-C and SIGTERM never cut a derive short
+  (run.deferred_interrupt).
+CRCs (D26): a memmap never checks a zip member's CRC-32 and save_persons writes fresh ones, so
+  derive first reads the whole persons file once through zipfile (crc_problems) and refuses a
+  damaged one (nothing is written; only a re-extraction can restore it), and it publishes nothing
+  unless the members it copies unchanged were staged with the CRCs that read verified (its memmaps
+  read the file a second time); check does the same read unless told not to.
 Memory: a SpillWriter holds one chunk; finalize, derive and check read the big columns through
   memmaps and handle kpts/poses in blocks of _BLOCK_FRAMES frames, so RAM is O(T + N) small
   arrays plus one block, for any video length.
@@ -58,22 +78,37 @@ import struct
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional, Tuple
+from typing import Dict, Iterator, List, Optional, Protocol, Tuple, Union
 
 import numpy as np
 
 from . import env
 from . import signer
-from .meta import compute_meta_row
-from .select import DEFAULT_POSING_RULES, PRIMARY_RULES
+from .meta import META_VERSION, MSLT_COMMIT, legacy_meta_row, meta_row, people_in_region
+from .rules import Rule, RuleLike, as_frame_rule, as_rule, is_video_rule
+from .select import DEFAULT_POSING_RULES, FrameRule
 from .settings import Settings
 from .types import COUNT_SET, NUM_KEYPOINTS, POSE_SET, POSED, SCHEMA_VERSION, ChunkDets, ChunkPoses, VideoInfo
+
+
+class RuleSource(Protocol):
+    """What resolves a dataset's rule names: a Dataset or its class (Dataset.rule)."""
+
+    def rule(self, name: str) -> Rule: ...
+
 
 PERSONS_MEMBERS = ('schema_version', 'video_id', 'frame_size', 'fps', 'num_frames', 'det_offsets', 'det_boxes',
                    'det_scores', 'det_flags', 'num_persons', 'kpt_offsets', 'kpt_det', 'kpts', 'kpt_primary',
                    'primary_rule', 'meta', 'provenance')
 _ROW = (NUM_KEYPOINTS, 3)   # one person's keypoints in the saved encoding
 _BLOCK_FRAMES = 4096        # frames per block when streaming or comparing poses (~6.5 MB)
+_CRC_READ = 16 << 20        # bytes per read when crc_problems verifies a zip
+# persons members that `derive` copies unchanged (det_flags and num_persons follow the count
+# settings; kpt_primary, primary_rule, meta and provenance the rule and the meta row): re-saved,
+# each keeps its bytes, so its CRC-32.
+_DERIVE_KEEPS = ('schema_version', 'video_id', 'frame_size', 'fps', 'num_frames', 'det_offsets', 'det_boxes',
+                 'det_scores', 'kpt_offsets', 'kpt_det', 'kpts')
+_REEXTRACT = 're-extract the video: delete its done marker'
 # Spill columns in .work/<vid>/<name>.bin: dtype and per-row shape. *_ends are the CSR offsets
 # without their leading 0; kpt_det is already video-global.
 _SPILL_COLUMNS = {
@@ -164,8 +199,13 @@ class PersonsRecord:
         """(T,133,3) float32: the primary's kpts row per frame, zeros where kpt_primary == -1."""
         return self._pose_block(0, self.num_frames)
 
-    def problems(self, poses: Optional[np.ndarray] = None) -> List[str]:
-        """Invariant violations as readable lines (empty = OK); `poses` is checked if given."""
+    def problems(self, poses: Optional[np.ndarray] = None, rule: Optional[RuleLike] = None,
+                 dataset: Optional[RuleSource] = None) -> List[str]:
+        """Invariant violations as readable lines (empty = OK); `poses` is checked if given. `rule`
+        is the record's primary_rule as a rule object (a dataset's own rule, Dataset.rule); None =
+        resolved by `dataset` (Dataset.rule: a name it does not know is a problem, even another
+        built-in dataset's own rule), else by name alone (rules.as_rule: the framework's or a
+        built-in dataset's own)."""
         out = self._structure_problems()
         if out:
             return out
@@ -186,15 +226,31 @@ class PersonsRecord:
             kpt_frame = np.repeat(np.arange(t), kpt_count)
             _report(out, 'kpt rows are not the POSED rows (index)',
                     np.unique(kpt_frame[np.asarray(self.kpt_det) != posed_rows]))
-        position, not_posed = _rule_primary(self, self.primary_rule)
-        _report(out, f'the {self.primary_rule!r} pick is not posed', np.flatnonzero(not_posed))
-        empty = 'where it finds no signer' if self.primary_rule in signer.VIDEO_RULES else 'exactly without a pose set'
-        _report(out, f'kpt_primary is not the {self.primary_rule!r} pick (-1 {empty})',
-                np.flatnonzero(~not_posed & (position != self.kpt_primary)))
-        row = compute_meta_row(self.video_id, self.frame_size, self.fps, self.num_persons, self.kpt_offsets,
-                               self.kpts, self.kpt_primary)
-        if _canonical(row) != _canonical(self.meta):
-            out.append('meta is not the row computed from the record')
+        try:
+            if rule is None and dataset is not None:
+                rule = dataset.rule(self.primary_rule)
+            rule = as_rule(self.primary_rule if rule is None else rule)
+        except KeyError as e:
+            out.append(f'unknown primary rule {self.primary_rule!r}: {e.args[0]}' if dataset is not None else
+                       f"unknown primary rule {self.primary_rule!r} (a dataset's own rule is checked with its "
+                       f'dataset)')
+            return out
+        if rule.name != self.primary_rule:
+            out.append(f"the record's primary rule is {self.primary_rule!r}, not {rule.name!r}")
+            return out
+        version = self.provenance.get('meta_version')
+        if version not in (None, META_VERSION):   # derived by older (or newer) code, whose rules may pick otherwise
+            out.append(f'derived by other code (meta_version {version!r}, this code writes {META_VERSION}): its '
+                       f'picks and meta row are not checked; `derive` re-derives it')
+        else:
+            position, not_posed, region = _rule_primary(self, rule)
+            _report(out, f'the {self.primary_rule!r} pick is not posed', np.flatnonzero(not_posed))
+            empty = 'where it finds no signer' if is_video_rule(rule) else 'exactly without a pose set'
+            _report(out, f'kpt_primary is not the {self.primary_rule!r} pick (-1 {empty})',
+                    np.flatnonzero(~not_posed & (position != self.kpt_primary)))
+            if _canonical(_meta_row(self, region) if version == META_VERSION else
+                          _legacy_meta_row(self)) != _canonical(self.meta):
+                out.append('meta is not the row computed from the record')
         if poses is not None:
             out.extend(self._poses_problems(poses))
         return out
@@ -224,8 +280,6 @@ class PersonsRecord:
         primary = np.asarray(self.kpt_primary)
         _report(out, 'kpt_primary outside the posed list',
                 np.flatnonzero((primary < -1) | (primary >= np.diff(self.kpt_offsets))))
-        if self.primary_rule not in PRIMARY_RULES and self.primary_rule not in signer.VIDEO_RULES:
-            out.append(f'unknown primary rule {self.primary_rule!r}')
         if len(self.frame_size) != 2 or min(self.frame_size) < 1 or len(self.fps) != 2 or min(self.fps) < 1:
             out.append(f'bad frame_size {self.frame_size} or fps {self.fps}')
         return out
@@ -263,16 +317,24 @@ def _canonical(obj: object) -> str:
     return json.dumps(obj, sort_keys=True, allow_nan=True)
 
 
-def _rule_primary(record: PersonsRecord, rule_name: str) -> Tuple[np.ndarray, np.ndarray]:
-    """Per frame: the position of the rule's pick in the posed list (-1 without a pick), and
-    whether the pick is missing from the posed rows (that rule would need re-extraction; never
-    for a video-level rule, which chooses among the posed rows)."""
+def _rule_primary(record: PersonsRecord, rule: RuleLike) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
+    """Per frame: the position of the rule's pick in the posed list (-1 without a pick), whether
+    the pick is missing from the posed rows (that rule would need re-extraction; never for a
+    video-level rule, which chooses among the posed rows), and for a video-level rule the (T,4)
+    interpreter's region (signer.SignerChoice.region; None for a per-frame rule). A video-level
+    rule sees signer.PosedPeople: the posed boxes, scores and keypoints (record.kpts, read only as
+    far as the rule reads them: BOBSL's signer_track the shoulders, D24, Auslan News'
+    signer_track_right the shoulders and wrists, D21). Raises ValueError when a video-level rule
+    returns a malformed choice."""
+    rule = as_rule(rule)
     det_offsets, kpt_offsets = np.asarray(record.det_offsets), np.asarray(record.kpt_offsets)
     boxes, scores, kpt_det = np.asarray(record.det_boxes), np.asarray(record.det_scores), np.asarray(record.kpt_det)
     not_posed = np.zeros(record.num_frames, bool)
-    if rule_name in signer.VIDEO_RULES:
-        return signer.apply_video_rule(rule_name, boxes[kpt_det], kpt_offsets, record.fps), not_posed
-    rule = PRIMARY_RULES[rule_name]
+    if is_video_rule(rule):
+        people = signer.PosedPeople(boxes[kpt_det], scores[kpt_det], kpt_offsets, record.kpts, record.fps,
+                                    record.frame_size)
+        primary, region = _checked_choice(rule.name, rule.choose(people), np.diff(kpt_offsets))
+        return primary, not_posed, region
     pose = (np.asarray(record.det_flags) & POSE_SET) != 0
     position = np.full(record.num_frames, -1, np.int64)
     det_frame = np.repeat(np.arange(record.num_frames), np.diff(det_offsets))
@@ -284,7 +346,41 @@ def _rule_primary(record: PersonsRecord, rule_name: str) -> Tuple[np.ndarray, np
             position[t] = hit[0]
         else:
             not_posed[t] = True
-    return position, not_posed
+    return position, not_posed, None
+
+
+def _checked_choice(name: str, choice: signer.SignerChoice, posed: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """(primary, region) of a video-level rule's choice, after checking it against the record:
+    (T,) integer positions within each frame's posed list (`posed`: (T,) posed rows per frame) or
+    -1, and a (T,4) region."""
+    t = len(posed)
+    primary, region = np.asarray(choice.primary), np.asarray(choice.region)
+    if primary.shape != (t,) or not np.issubdtype(primary.dtype, np.integer) or region.shape != (t, 4):
+        raise ValueError(f'video-level rule {name!r} returned primary {primary.dtype} {primary.shape} and region '
+                         f'{region.shape}; expected ({t},) integers and ({t}, 4)')
+    bad = np.flatnonzero((primary < -1) | (primary >= posed))
+    if len(bad):
+        raise ValueError(f'video-level rule {name!r} picks outside the posed list in {len(bad)} frame(s), '
+                         f'first {bad[0]}')
+    return primary, region
+
+
+def _meta_row(record: PersonsRecord, region: Optional[np.ndarray]) -> Dict[str, object]:
+    """The current meta row of `record` (meta.meta_row): masked_runs over the posed people inside
+    `region` (a video-level rule's, from _rule_primary) plus the primary when it is given, else over
+    every posed person."""
+    candidates = None
+    if region is not None:
+        candidates = people_in_region(region, record.det_offsets, record.det_boxes, record.det_flags,
+                                      record.kpt_det).posed
+    return meta_row(record.video_id, record.frame_size, record.fps, record.num_persons, record.kpt_offsets,
+                    record.kpts, record.kpt_primary, candidates)
+
+
+def _legacy_meta_row(record: PersonsRecord) -> Dict[str, object]:
+    """The legacy whole-frame meta row of `record` (meta.legacy_meta_row): what finalize commits."""
+    return legacy_meta_row(record.video_id, record.frame_size, record.fps, record.num_persons, record.kpt_offsets,
+                           record.kpts, record.kpt_primary)
 
 
 def load_persons(path: Path, mmap_mode: Optional[str] = None) -> PersonsRecord:
@@ -338,6 +434,30 @@ def save_persons(path: Path, record: PersonsRecord) -> None:
 
 def _meta_json(row: Dict[str, object]) -> str:
     return json.dumps(row, allow_nan=True)
+
+
+def crc_problems(path: Path) -> List[str]:
+    """One line per member of the zip at `path` whose bytes do not match its CRC-32 or cannot be
+    read (a bad local header, a member running past the end of the file); [] = intact. Reads the
+    whole file once, sequentially, through zipfile, which checks each member's CRC at its end
+    (load_persons with mmap_mode never does). Raises zipfile.BadZipFile when there is no readable
+    central directory."""
+    out = []
+    with zipfile.ZipFile(path) as zf:
+        for info in zf.infolist():
+            try:
+                with zf.open(info) as member:
+                    while member.read(_CRC_READ):
+                        pass
+            except (zipfile.BadZipFile, EOFError) as e:
+                out.append(f'{info.filename}: {str(e) or type(e).__name__}')
+    return out
+
+
+def _member_crcs(path: Path) -> Dict[str, int]:
+    """{member name: the CRC-32 the zip's central directory records for it} (reads only that directory)."""
+    with zipfile.ZipFile(path) as zf:
+        return {info.filename: info.CRC for info in zf.infolist()}
 
 
 def _read_npz(path: Path, mmap_mode: Optional[str]) -> Dict[str, np.ndarray]:
@@ -436,12 +556,13 @@ class SpillWriter:
     poses go straight into an NpyStreamWriter at .work/<vid>/poses.npy.
     """
 
-    def __init__(self, root: Path, video: VideoInfo, primary_rule: str) -> None:
+    def __init__(self, root: Path, video: VideoInfo, primary_rule: Union[str, FrameRule]) -> None:
         """Clear and create .work/<vid>/ (a previous crash may have left files there).
-        `primary_rule` is the per-frame rule the chunks were selected with (select.select_chunk)."""
-        _check_frame_rule(primary_rule)
+        `primary_rule` is the per-frame rule the chunks were selected with (select.select_chunk): a
+        FrameRule, or a framework rule's name (KeyError for an unknown or video-level rule)."""
+        self._rule = as_frame_rule(primary_rule)
         self.video = video
-        self.primary_rule = primary_rule
+        self.primary_rule = self._rule.name
         self._layout = OutputLayout(root)
         self._dir = self._layout.work(video.video_id)
         _fresh_dir(self._dir)
@@ -485,7 +606,7 @@ class SpillWriter:
         self._kpts += len(poses.det_index)
 
     def finalize(self, settings: Settings, provenance: Dict[str, object]) -> CommitInfo:
-        """Close the spill, build the meta row (meta.compute_meta_row with T = frames_written),
+        """Close the spill, build the legacy meta row (meta.legacy_meta_row with T = frames_written),
         write persons/poses/meta/done via temp files, check invariants (raise on any problem),
         commit in the documented order and remove .work/<vid>/. `provenance` comes from
         make_provenance; its hashes (checked against `settings` and the rule) go into the done
@@ -493,7 +614,7 @@ class SpillWriter:
         vid = self.video.video_id
         if self._state != 'open':
             raise RuntimeError(f'{vid}: the spill is closed')
-        _check_provenance(provenance, settings, self.primary_rule)
+        _check_provenance(provenance, settings, self._rule)
         self._state = 'closed'
         for f in self._files.values():
             f.close()
@@ -530,9 +651,9 @@ class SpillWriter:
             num_persons=columns['num_persons'], kpt_offsets=np.concatenate([zero, columns['kpt_ends']]),
             kpt_det=columns['kpt_det'], kpts=columns['kpts'], kpt_primary=columns['kpt_primary'],
             primary_rule=self.primary_rule, meta={}, provenance=provenance)
-        record.meta = compute_meta_row(v.video_id, record.frame_size, record.fps, record.num_persons,
-                                       record.kpt_offsets, record.kpts, record.kpt_primary)
-        _raise_problems(record, np.load(self._dir / _STAGED_POSES, mmap_mode='r'))
+        record.meta = legacy_meta_row(v.video_id, record.frame_size, record.fps, record.num_persons,
+                                      record.kpt_offsets, record.kpts, record.kpt_primary)
+        _raise_problems(record, np.load(self._dir / _STAGED_POSES, mmap_mode='r'), self._rule)
         return _stage_files(self._dir, record)
 
 
@@ -546,29 +667,34 @@ def _read_column(path: Path, dtype, row_shape: Tuple[int, ...]) -> np.ndarray:
     return np.memmap(path, dtype=dtype, mode='r', shape=(size // row_bytes,) + row_shape)
 
 
-def _raise_problems(record: PersonsRecord, poses: np.ndarray) -> None:
-    problems = record.problems(poses)
+def _raise_problems(record: PersonsRecord, poses: Optional[np.ndarray], rule: Rule) -> None:
+    problems = record.problems(poses, rule)
     if problems:
         raise ValueError(f'{record.video_id}: invalid record: ' + '; '.join(problems))
 
 
-def _stage_files(work: Path, record: PersonsRecord) -> CommitInfo:
-    """Write persons.npz, meta.json and done.json (fsynced) next to the staged poses.npy."""
+def _stage_files(work: Path, record: PersonsRecord, poses: Optional[Path] = None) -> CommitInfo:
+    """Write persons.npz, meta.json and done.json (fsynced) next to the staged poses.npy (or, with
+    `poses`, for that already committed poses file, which the commit then keeps)."""
     save_persons(work / _STAGED_PERSONS, record)
     _write_text(work / _STAGED_META, _meta_json(record.meta) + '\n')
     info = CommitInfo(video_id=record.video_id, num_frames=record.num_frames,
                       extraction_hash=str(record.provenance['extraction_hash']),
                       derivation_hash=str(record.provenance['derivation_hash']),
-                      poses_bytes=(work / _STAGED_POSES).stat().st_size,
+                      poses_bytes=(work / _STAGED_POSES if poses is None else poses).stat().st_size,
                       persons_bytes=(work / _STAGED_PERSONS).stat().st_size)
     _write_text(work / _STAGED_DONE, json.dumps(dataclasses.asdict(info), sort_keys=True) + '\n')
     return info
 
 
-def _publish(layout: OutputLayout, work: Path, video_id: str, drop_old_marker: bool) -> None:
-    """Rename the staged files into place in the commit order (module docstring), remove `work`."""
+def _publish(layout: OutputLayout, work: Path, video_id: str, drop_old_marker: bool,
+             keep_poses: bool = False) -> None:
+    """Rename the staged files into place in the commit order (module docstring), remove `work`;
+    with `keep_poses` nothing was staged for poses/<vid>.npy and the committed file stays."""
     moves = ((work / _STAGED_PERSONS, layout.persons(video_id)), (work / _STAGED_POSES, layout.poses(video_id)),
              (work / _STAGED_META, layout.meta_json(video_id)))
+    if keep_poses:
+        moves = (moves[0], moves[2])
     marker = layout.done_marker(video_id)
     for directory in [dst.parent for _, dst in moves] + [marker.parent]:
         directory.mkdir(parents=True, exist_ok=True)
@@ -584,24 +710,14 @@ def _publish(layout: OutputLayout, work: Path, video_id: str, drop_old_marker: b
     shutil.rmtree(work)
 
 
-def _check_provenance(provenance: Dict[str, object], settings: Settings, primary_rule: str) -> None:
+def _check_provenance(provenance: Dict[str, object], settings: Settings, primary_rule: FrameRule) -> None:
     """The done marker takes its hashes from `provenance`; they must describe this run."""
     want = dict(extraction_hash=extraction_hash(settings, provenance.get('model_provenance', {}), primary_rule),
-                derivation_hash=derivation_hash(settings, primary_rule))
+                derivation_hash=commit_derivation_hash(settings, primary_rule))
     for key, value in want.items():
         if provenance.get(key) != value:
-            raise ValueError(f'provenance {key} does not match these settings and rule {primary_rule!r} '
+            raise ValueError(f'provenance {key} does not match these settings and rule {primary_rule.name!r} '
                              f'(build it with make_provenance)')
-
-
-def _check_frame_rule(name: str) -> None:
-    if name not in PRIMARY_RULES:
-        raise KeyError(f'unknown per-frame primary rule {name!r}; known: {sorted(PRIMARY_RULES)}')
-
-
-def _check_rule(name: str) -> None:
-    if name not in PRIMARY_RULES and name not in signer.VIDEO_RULES:
-        raise KeyError(f'unknown primary rule {name!r}; known: {sorted(set(PRIMARY_RULES) | set(signer.VIDEO_RULES))}')
 
 
 def _fresh_dir(path: Path) -> None:
@@ -633,37 +749,57 @@ def _sha256_json(obj: object) -> str:
     return hashlib.sha256(json.dumps(obj, sort_keys=True).encode()).hexdigest()
 
 
-def extraction_hash(settings: Settings, model_provenance: Dict[str, object], posing_rule: Optional[str] = None) -> str:
+def extraction_hash(settings: Settings, model_provenance: Dict[str, object],
+                    posing_rule: Optional[Union[str, FrameRule]] = None) -> str:
     """sha256 hex of json.dumps({schema_version, settings.extraction_fields(), every *_sha256
-    entry of engines.model_provenance(settings)}, sort_keys=True), as one flat dict, plus
-    posing_rule=<name> when the per-frame rule used by extraction changes which rows are posed
-    (not for select.DEFAULT_POSING_RULES, so those hashes equal the rule-less one)."""
+    entry of engines.model_provenance(settings)}, sort_keys=True), as one flat dict, plus, when the
+    per-frame rule used by extraction changes which rows are posed (not for
+    select.DEFAULT_POSING_RULES, so those hashes equal the rule-less one), posing_rule=<its name>
+    and, when the rule has params (select.FrameRule), posing_rule_params=<them>. `posing_rule` is a
+    FrameRule (a dataset's own, Dataset.frame_rule) or a framework rule's name."""
     fields = dict(schema_version=SCHEMA_VERSION, **settings.extraction_fields())
     fields.update({k: v for k, v in model_provenance.items() if k.endswith('_sha256')})
-    if posing_rule is not None and posing_rule not in DEFAULT_POSING_RULES:
-        _check_frame_rule(posing_rule)
-        fields['posing_rule'] = posing_rule
+    rule = None if posing_rule is None else as_frame_rule(posing_rule)
+    if rule is not None and rule.name not in DEFAULT_POSING_RULES:
+        fields['posing_rule'] = rule.name
+        if rule.params is not None:
+            fields['posing_rule_params'] = dict(rule.params)
     return _sha256_json(fields)
 
 
-def derivation_hash(settings: Settings, primary_rule: str) -> str:
-    """sha256 hex of json.dumps(settings.derivation_fields(primary_rule), sort_keys=True), with
-    primary_rule_params=signer.rule_params(primary_rule) added for a video-level rule."""
-    fields = settings.derivation_fields(primary_rule)
-    if primary_rule in signer.VIDEO_RULES:
-        fields['primary_rule_params'] = signer.rule_params(primary_rule)
+def derivation_hash(settings: Settings, primary_rule: RuleLike) -> str:
+    """The derivation_hash of outputs derived with `primary_rule` (what `derive` writes; the target
+    of resume_action): sha256 hex of json.dumps(settings.derivation_fields(<its name>) plus
+    primary_rule_params=<the rule's params> for a video-level rule (signer.VideoRule.params) or a
+    per-frame rule with params, plus meta_version=meta.META_VERSION, sort_keys=True). `primary_rule`
+    is a rule object (a dataset's own, Dataset.rule) or a framework rule's name."""
+    rule = as_rule(primary_rule)
+    fields = settings.derivation_fields(rule.name)
+    if is_video_rule(rule) or rule.params is not None:
+        fields['primary_rule_params'] = dict(rule.params)
+    fields['meta_version'] = META_VERSION
     return _sha256_json(fields)
 
 
-def make_provenance(settings: Settings, primary_rule: str, model_provenance: Dict[str, object],
+def commit_derivation_hash(settings: Settings, primary_rule: Union[str, FrameRule]) -> str:
+    """The derivation_hash of a GPU worker's commit with the per-frame rule `primary_rule`
+    (SpillWriter.finalize, which writes the legacy whole-frame meta row): sha256 hex of
+    json.dumps(settings.derivation_fields(<its name>), sort_keys=True), unchanged since the BOBSL
+    production run started (tests/test_compat.py); the rule's params are not in it. It never equals
+    derivation_hash, so the parent derives every commit before counting it done (run.py)."""
+    return _sha256_json(settings.derivation_fields(as_frame_rule(primary_rule).name))
+
+
+def make_provenance(settings: Settings, primary_rule: Union[str, FrameRule], model_provenance: Dict[str, object],
                     gpu_name: str) -> Dict[str, object]:
-    """The `provenance` JSON of an extraction with the per-frame rule `primary_rule`: git_sha
-    (env.git_sha), extraction_hash (posing_rule = primary_rule), derivation_hash,
+    """The `provenance` JSON of an extraction with the per-frame rule `primary_rule` (a FrameRule or
+    a framework rule's name): git_sha (env.git_sha), extraction_hash (posing_rule = primary_rule),
+    derivation_hash (commit_derivation_hash),
     model_provenance (engines.model_provenance), libraries (env.library_versions), gpu_name,
     settings (Settings.as_json)."""
     return dict(git_sha=env.git_sha(settings.repo_root),
                 extraction_hash=extraction_hash(settings, model_provenance, primary_rule),
-                derivation_hash=derivation_hash(settings, primary_rule), model_provenance=dict(model_provenance),
+                derivation_hash=commit_derivation_hash(settings, primary_rule), model_provenance=dict(model_provenance),
                 libraries=env.library_versions(include_trt=settings.backend == 'trt'), gpu_name=gpu_name,
                 settings=settings.as_json())
 
@@ -715,25 +851,36 @@ def record_failure(root: Path, video_id: str, error: str, traceback_text: str, a
 
 
 # --------------------------------------------------------------------------- derive
-def derive(root: Path, video_id: str, settings: Settings, primary_rule: str) -> CommitInfo:
+def derive(root: Path, video_id: str, settings: Settings, primary_rule: RuleLike) -> CommitInfo:
     """CPU re-derivation from persons/<vid>.npz (spec D6, D14, §4.4), no GPU.
 
+    `primary_rule` is a rule object (a dataset's own, Dataset.rule) or a framework rule's name.
     Recomputes COUNT_SET bits per frame with detpost.count_set_mask(det_boxes, det_scores,
-    settings.count_score_thr, settings.count_nms_thr), num_persons, kpt_primary with
-    select.PRIMARY_RULES[primary_rule] on each frame's POSE_SET rows (the pick must be a POSED
-    row, else raise ValueError: the rule needs re-extraction) or with the video-level rule
-    signer.VIDEO_RULES[primary_rule] on the posed rows, then poses, the meta row and the
-    provenance's derivation_hash and count thresholds (in provenance['settings']); POSE_SET,
-    POSED, det_* and kpts are unchanged. Commits in the documented order. With unchanged
-    settings it reproduces every output file byte-for-byte.
+    settings.count_score_thr, settings.count_nms_thr), num_persons, kpt_primary with a per-frame
+    rule on each frame's POSE_SET rows (the pick must be a POSED row, else raise ValueError: the
+    rule needs re-extraction) or with a video-level rule on the posed people
+    (signer.PosedPeople), then poses, the current meta row
+    (meta.meta_row; masked_runs over the people in the interpreter's region for a video-level rule)
+    and the provenance's derivation_hash, count thresholds (in provenance['settings']),
+    meta_version (meta.META_VERSION) and mslt_commit (meta.MSLT_COMMIT, the misaligned-slt
+    commit the row's run definitions follow); POSE_SET, POSED, det_* and kpts are unchanged.
+    Commits in the documented order. Deriving again with the same settings and rule reproduces
+    every output file byte-for-byte; a commit of the GPU workers (legacy meta row) changes only in
+    its meta row and provenance (and the done marker), never in what render-done draws.
+    poses/<vid>.npy is written only when its bytes change (_holds_poses), so such a derive rewrites
+    persons/ and the small files but leaves poses/ untouched. A persons file that fails
+    crc_problems, or is no readable zip, raises ValueError before anything is staged (rewriting it
+    would give damaged rows valid CRCs). The rows are then read again through memmaps, so the
+    staged members that derive keeps (_DERIVE_KEEPS) must have the CRCs just verified, else it
+    raises ValueError and publishes nothing (a faulty second read would otherwise be committed).
     """
-    _check_rule(primary_rule)
+    rule = as_rule(primary_rule)
     layout = OutputLayout(root)
     work = layout.work(video_id)
     _fresh_dir(work)
     try:
-        info = _stage_derived(layout, work, video_id, settings, primary_rule)
-        _publish(layout, work, video_id, drop_old_marker=False)
+        info, keep_poses = _stage_derived(layout, work, video_id, settings, rule)
+        _publish(layout, work, video_id, drop_old_marker=False, keep_poses=keep_poses)
     except BaseException:
         shutil.rmtree(work, ignore_errors=True)
         raise
@@ -741,13 +888,23 @@ def derive(root: Path, video_id: str, settings: Settings, primary_rule: str) -> 
 
 
 def _stage_derived(layout: OutputLayout, work: Path, video_id: str, settings: Settings,
-                   primary_rule: str) -> CommitInfo:
-    """Stage the re-derived files in `work`; the memmaps of the old record die with this call."""
+                   primary_rule: Rule) -> Tuple[CommitInfo, bool]:
+    """Stage the re-derived files in `work` and say whether the committed poses/<vid>.npy is kept
+    (it already holds the derived bytes, so none are staged); the memmaps of the old record die
+    with this call."""
     from .detpost import count_set_mask   # detpost imports torch; keep `record` importable without it
-    old = load_persons(layout.persons(video_id), mmap_mode='r')
+    persons = layout.persons(video_id)
+    try:
+        bad = crc_problems(persons)
+    except zipfile.BadZipFile as e:
+        raise ValueError(f'{persons} is not a readable zip ({e}), so it is not derived ({_REEXTRACT})') from e
+    if bad:
+        raise ValueError(f'{persons} fails its CRC check, so it is not derived ({_REEXTRACT}): ' + '; '.join(bad))
+    verified = _member_crcs(persons)
+    old = load_persons(persons, mmap_mode='r')
     damaged = old._structure_problems() + ([] if old.video_id == video_id else [f'holds video {old.video_id!r}'])
     if damaged:
-        raise ValueError(f'{layout.persons(video_id)}: ' + '; '.join(damaged))
+        raise ValueError(f'{persons}: ' + '; '.join(damaged))
     t = old.num_frames
     offsets = np.asarray(old.det_offsets)
     boxes, scores = np.asarray(old.det_boxes), np.asarray(old.det_scores)
@@ -759,25 +916,58 @@ def _stage_derived(layout: OutputLayout, work: Path, video_id: str, settings: Se
     count = np.bincount(np.repeat(np.arange(t), np.diff(offsets))[(flags & COUNT_SET) != 0], minlength=t)
     if count.max(initial=0) > 255:
         raise ValueError(f'{video_id}: more than 255 people in the count set of one frame')
-    position, not_posed = _rule_primary(old, primary_rule)
+    position, not_posed, region = _rule_primary(old, primary_rule)
     if not_posed.any():
         frames = np.flatnonzero(not_posed)
-        raise ValueError(f'{video_id}: rule {primary_rule!r} picks a person that was not posed in {len(frames)} '
-                         f'frame(s), first {frames[0]}; this rule needs re-extraction')
+        raise ValueError(f'{video_id}: rule {primary_rule.name!r} picks a person that was not posed in '
+                         f'{len(frames)} frame(s), first {frames[0]}; this rule needs re-extraction')
     provenance = json.loads(json.dumps(old.provenance))
     provenance['derivation_hash'] = derivation_hash(settings, primary_rule)
     provenance['settings'].update(count_score_thr=settings.count_score_thr, count_nms_thr=settings.count_nms_thr)
+    provenance['meta_version'] = META_VERSION
+    provenance['mslt_commit'] = MSLT_COMMIT
     record = dataclasses.replace(old, det_flags=flags, num_persons=count.astype(np.uint8),
-                                 kpt_primary=position.astype(np.int8), primary_rule=primary_rule,
+                                 kpt_primary=position.astype(np.int8), primary_rule=primary_rule.name,
                                  provenance=provenance)
-    record.meta = compute_meta_row(video_id, record.frame_size, record.fps, record.num_persons,
-                                   record.kpt_offsets, record.kpts, record.kpt_primary)
-    writer = NpyStreamWriter(work / _STAGED_POSES)
-    for _, block in record._pose_blocks():
-        writer.append(block)
-    writer.close()
-    _raise_problems(record, np.load(work / _STAGED_POSES, mmap_mode='r'))
-    return _stage_files(work, record)
+    record.meta = _meta_row(record, region)
+    committed = layout.poses(video_id)
+    keep_poses = _holds_poses(committed, record)
+    if keep_poses:
+        # Compared bit for bit just now: write nothing for poses/ (a meta-only derive, D19, then
+        # rewrites only persons/ and the small files on the volume).
+        _raise_problems(record, None, primary_rule)
+    else:
+        writer = NpyStreamWriter(work / _STAGED_POSES)
+        for _, block in record._pose_blocks():
+            writer.append(block)
+        writer.close()
+        _raise_problems(record, np.load(work / _STAGED_POSES, mmap_mode='r'), primary_rule)
+    info = _stage_files(work, record, committed if keep_poses else None)
+    # The memmaps are a second read of the file; np.savez computed the staged CRCs from what they gave.
+    staged = _member_crcs(work / _STAGED_PERSONS)
+    reread = [name for name in _DERIVE_KEEPS if staged.get(f'{name}.npy') != verified.get(f'{name}.npy')]
+    if reread:
+        raise ValueError(f'{persons}: derive read other bytes of {", ".join(reread)} than its CRC check did (a '
+                         f'faulty read, or the file changed meanwhile), so it is not derived; run derive again')
+    return info, keep_poses
+
+
+def _holds_poses(path: Path, record: PersonsRecord) -> bool:
+    """True when `path` is byte for byte what np.save writes for record.poses(): the np.save v1.0
+    header of (T,133,3) float32, the exact size, every row bitwise. Reads only, up to the first
+    block that differs."""
+    header = _npy_header(record.num_frames)
+    try:
+        if path.stat().st_size != len(header) + record.num_frames * NUM_KEYPOINTS * 3 * 4:
+            return False
+        with open(path, 'rb') as f:
+            if f.read(len(header)) != header:
+                return False
+    except FileNotFoundError:
+        return False
+    poses = np.memmap(path, dtype=np.float32, mode='r', offset=len(header), shape=(record.num_frames,) + _ROW)
+    return all(np.array_equal(np.asarray(poses[start:start + len(block)]).view(np.uint32), block.view(np.uint32))
+               for start, block in record._pose_blocks())
 
 
 # --------------------------------------------------------------------------- check
@@ -795,14 +985,19 @@ class CheckReport:
         return not self.problems
 
 
-def check(root: Path, video_id: str, switch_iou: float = 0.3, window_s: float = 2.0) -> CheckReport:
+def check(root: Path, video_id: str, switch_iou: float = 0.3, window_s: float = 2.0,
+          dataset: Optional[RuleSource] = None, verify_crc: bool = True) -> CheckReport:
     """Verify the §4.1 invariants for a committed video and flag primary switches.
 
-    Besides PersonsRecord.problems: the poses file header and size, the done marker (hashes,
-    sizes, T) and the .state/meta row against the record. A switch is a frame t where both t-1
-    and t have a primary and IoU(primary box t-1, primary box t) < switch_iou. Suggested windows
-    are [t - window_s*fps, t + window_s*fps) (rounded up to whole frames) clipped to [0, T) and
-    merged when they overlap or touch.
+    `dataset` (a Dataset or its class) resolves the record's primary_rule (Dataset.rule, D22: a
+    rule the dataset does not know, also another built-in dataset's own, is a problem); None = by
+    name alone (the framework's rules and the built-in datasets' own, rules.as_rule).
+    Besides PersonsRecord.problems: the CRC-32 of every persons member (crc_problems: one
+    sequential read of the file; `verify_crc` False skips it), the poses file header and size, the
+    done marker (hashes, sizes, T) and the .state/meta row against the record. A switch is a frame
+    t where both t-1 and t have a primary and IoU(primary box t-1, primary box t) < switch_iou.
+    Suggested windows are [t - window_s*fps, t + window_s*fps) (rounded up to whole frames)
+    clipped to [0, T) and merged when they overlap or touch.
     """
     layout = OutputLayout(root)
     paths = (layout.persons(video_id), layout.poses(video_id), layout.meta_json(video_id), layout.done_marker(video_id))
@@ -810,9 +1005,11 @@ def check(root: Path, video_id: str, switch_iou: float = 0.3, window_s: float = 
     if missing:
         return CheckReport(video_id, missing, [], [])
     try:
+        damaged = crc_problems(layout.persons(video_id)) if verify_crc else []
         record = load_persons(layout.persons(video_id), mmap_mode='r')
         poses = np.load(layout.poses(video_id), mmap_mode='r')
-        problems = _file_problems(layout, video_id, record)
+        problems = [f'the persons file fails its CRC check: {line}' for line in damaged]
+        problems += _file_problems(layout, video_id, record)
     except (OSError, ValueError, zipfile.BadZipFile) as e:
         return CheckReport(video_id, [f'unreadable output: {e}'], [], [])
     structural = record._structure_problems()
@@ -820,28 +1017,31 @@ def check(root: Path, video_id: str, switch_iou: float = 0.3, window_s: float = 
         return CheckReport(video_id, problems + structural, [], [])
     switches = _primary_switches(record, switch_iou)
     half = math.ceil(window_s * record.fps[0] / record.fps[1])
-    return CheckReport(video_id, problems + record.problems(poses), switches,
+    return CheckReport(video_id, problems + record.problems(poses, dataset=dataset), switches,
                        _merge_windows(switches, half, record.num_frames))
 
 
-def derivation_problems(root: Path, video_id: str, settings: Settings, primary_rule: str) -> List[str]:
+def derivation_problems(root: Path, video_id: str, settings: Settings, primary_rule: RuleLike) -> List[str]:
     """[] when the video's done marker has derivation_hash(settings, primary_rule), i.e. its outputs
-    were derived with the dataset's final rule and count settings; else one line naming the rule
-    they have (a commit left underived by a stop, crash or failed derive; `derive` fixes it).
+    were derived with the dataset's final rule, count settings and meta definitions; else one line
+    naming the rule they have (a commit left underived by a stop, crash or failed derive, or derived
+    by older code; `derive` fixes it).
     Missing or unreadable files are `check`'s problems, not reported here."""
+    rule = as_rule(primary_rule)
+    primary_rule = rule.name
     layout = OutputLayout(root)
     try:
         marker = json.loads(layout.done_marker(video_id).read_text(encoding='utf-8'))
     except (OSError, ValueError):
         return []
-    if marker.get('derivation_hash') == derivation_hash(settings, primary_rule):
+    if marker.get('derivation_hash') == derivation_hash(settings, rule):
         return []
     try:
         have: Optional[str] = load_persons(layout.persons(video_id), mmap_mode='r').primary_rule
     except (OSError, ValueError, zipfile.BadZipFile):
         have = None
     if have == primary_rule:
-        what = f'derived with {primary_rule!r} under other rule parameters or count settings'
+        what = f'derived with {primary_rule!r} under other rule parameters, count settings or meta definitions'
     else:
         what = f"derived with {'another rule' if have is None else repr(have)}, not the primary rule {primary_rule!r}"
     return [f'{what}: run `derive` (or resume `extract`)']

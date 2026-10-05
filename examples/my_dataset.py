@@ -5,6 +5,7 @@
 
 Outputs go to <data root>/my_dataset/dwpose/ (poses/, persons/, video_meta.csv, video_ids.csv).
 Optional: <data root>/my_dataset/splits.csv with lines `<file name>,<split>` (dev, test or train).
+A dataset can also define signer rules of its own (Dataset.rules): see examples/custom_rules.py.
 """
 import csv
 

@@ -1,0 +1,14 @@
+[flake8]
+max-line-length = 120
+# Anchored to this directory (so `data` never matches a nested directory) and added to flake8's
+# default excludes. slp_pose/model_configs is the vendored DWPose config and stays byte-identical;
+# .scratch holds the local issue tracker's throwaway scripts; models/ only holds checkpoints and engines.
+extend-exclude =
+    ./slp_pose/model_configs,
+    ./.venv,
+    ./mmpose,
+    ./data,
+    ./build,
+    ./dist,
+    ./models,
+    ./.scratch,
