@@ -69,6 +69,7 @@ class RunSummary:
     frames: int = 0
     seconds: float = 0.0
     pending: List[str] = field(default_factory=list)   # not finished: interrupted, or no GPU left
+    read_faults: int = 0   # failed reads that verifications retried (D28; each one a WARNING line)
 
 
 @dataclass(frozen=True)
@@ -81,7 +82,9 @@ class Timing:
     gpu_sample_s: float = 10.0       # nvidia-smi -> .state/gpu.csv
     progress_s: float = 60.0         # one progress line
     stop_grace_s: float = 120.0      # how long stopping workers may take before they are killed
-    merge_every: int = 50            # rewrite video_meta.csv after this many commits
+    merge_every: int = 50            # rewrite video_meta.csv after this many commits,
+    merge_s: float = 1800.0          # or at a commit this long after the last merge (D28),
+    merge_drained: bool = True       # and when the derives found at the run start are done (D28)
 
 
 def plan_videos(videos: Sequence[Video], split_order: Sequence[str] = (),
@@ -91,7 +94,9 @@ def plan_videos(videos: Sequence[Video], split_order: Sequence[str] = (),
 
     Order: datasets.schedule (split_order, then the largest file first). `video_ids` restricts the
     set (unknown ids raise ValueError); `limit` keeps the first N, and only those are probed. Probe
-    failures (video.VideoError, e.g. VFR) are raised with the video id.
+    failures (video.VideoError, e.g. VFR) are raised with the video id. A Video's expected_frames
+    (a source truncated in its archive, D28) goes into its VideoInfo, where the reader's frame-count
+    check reads it.
     """
     from .video import VideoError, probe
     by_id = {video.video_id: video for video in videos}
@@ -105,9 +110,12 @@ def plan_videos(videos: Sequence[Video], split_order: Sequence[str] = (),
 
     def probe_one(video: Video) -> VideoInfo:
         try:
-            return probe(video.path, video.video_id)
+            info = probe(video.path, video.video_id)
         except VideoError as e:
             raise VideoError(f'{video.video_id}: {e}') from e
+        if video.expected_frames is None:
+            return info
+        return dataclasses.replace(info, expected_frames=video.expected_frames)
 
     with ThreadPoolExecutor(probe_threads) as pool:
         return list(pool.map(probe_one, order))
@@ -136,8 +144,15 @@ def run_extract(dataset: Dataset, settings: Settings, out_root: Path, gpus: Sequ
       second Ctrl-C) are killed. Committed videos stay intact (a commit is never interrupted),
       the CSV is merged, then KeyboardInterrupt is re-raised.
     - merge_meta at the start (a run that died without its last merge, e.g. SIGKILL or a power
-      loss, left the CSV behind), after every timing.merge_every commits, and at the end however
-      the run ends (all work done, Ctrl-C / SIGTERM, an error), so the CSV lists every commit.
+      loss, left the CSV behind), after every timing.merge_every commits, at a commit
+      timing.merge_s after the last merge, when the derives found at the start are done
+      (timing.merge_drained; D28: the CSV lagged .state/meta by hours during a long run), and at
+      the end however the run ends (all work done, Ctrl-C / SIGTERM, an error), so the CSV lists
+      every commit.
+    - A derive refused for a reason a later read may not repeat (record.ReadFault or
+      record.CrcFailure on every immediate re-read, which on the Storage mount come from the same
+      cache, or an OSError) is retried once when the rest of the run's work is done (D28); before,
+      it waited for the next run. Retried read faults are counted in RunSummary.read_faults.
     """
     from . import engines
     started = time.time()
@@ -172,7 +187,7 @@ def run_extract(dataset: Dataset, settings: Settings, out_root: Path, gpus: Sequ
             else:
                 tasks.append(VideoTask(video, str(out_root), extraction_rule.name, allow_frame_mismatch, dataset=ref))
         log.info('%s -> %s: %d videos, %d to extract (%d frames), %d to derive, %d already done',
-                 dataset.name, out_root, len(videos), len(tasks), sum(t.video.nb_frames for t in tasks),
+                 dataset.name, out_root, len(videos), len(tasks), sum(t.video.frame_count for t in tasks),
                  len(derives), len(summary.skipped))
         supervisor = _Supervisor(settings, out_root, gpus, timing, worker_target, worker_hash,
                                  primary_rule, derivation_hash, summary, len(videos))
@@ -201,7 +216,8 @@ def run_derive(out_root: Path, settings: Settings, primary_rule: RuleLike,
         try:
             for vid in committed_videos(out_root) if video_ids is None else video_ids:
                 with deferred_interrupt():   # a Ctrl-C held during the derive is raised after the bookkeeping
-                    (derived if _derive_video(out_root, vid, settings, primary_rule) else failed).append(vid)
+                    ok = _derive_video(out_root, vid, settings, primary_rule) == _DERIVED
+                    (derived if ok else failed).append(vid)
         finally:
             with deferred_interrupt():
                 merge_meta(out_root)
@@ -293,8 +309,15 @@ def _sigterm_as_interrupt() -> Iterator[None]:
         signal.signal(signal.SIGTERM, previous)
 
 
-def _derive_video(out_root: Path, video_id: str, settings: Settings, primary_rule: Rule) -> bool:
-    """record.derive with Ctrl-C held; a failure is logged and recorded (attempt 1, no GPU).
+_DERIVED, _FAILED, _RETRY = 'derived', 'failed', 'retry'   # outcomes of _derive_video
+
+
+def _derive_video(out_root: Path, video_id: str, settings: Settings, primary_rule: Rule, attempt: int = 1,
+                  report: Optional[record.Report] = None) -> str:
+    """record.derive with Ctrl-C held; a failure is logged and recorded (`attempt`, no GPU).
+    Returns _DERIVED, _FAILED, or _RETRY for a failure a later derive may not repeat (a read fault
+    or CRC failure on every immediate re-read, record.ReadFault / record.CrcFailure, or an OSError;
+    D28). `report` takes the derive's retried read faults (None: WARNINGs in record's log).
 
     A Ctrl-C held here is raised when the block ends, before this returns: callers that count the
     result call this inside their own deferred_interrupt block (nested blocks are no-ops), so the
@@ -302,14 +325,14 @@ def _derive_video(out_root: Path, video_id: str, settings: Settings, primary_rul
     """
     with deferred_interrupt():
         try:
-            record.derive(out_root, video_id, settings, primary_rule)
+            record.derive(out_root, video_id, settings, primary_rule, report=report)
         except Exception as exc:
             error = f'derive: {type(exc).__name__}: {exc}'
             log.error('%s: %s', video_id, error)
-            record.record_failure(out_root, video_id, error, traceback.format_exc(), 1, None)
-            return False
+            record.record_failure(out_root, video_id, error, traceback.format_exc(), attempt, None)
+            return _RETRY if isinstance(exc, (record.ReadFault, record.CrcFailure, OSError)) else _FAILED
     log.info('%s: derived with %s', video_id, primary_rule.name)
-    return True
+    return _DERIVED
 
 
 def _duration(seconds: float) -> str:
@@ -322,6 +345,8 @@ def _log_summary(s: RunSummary) -> None:
     log.info('run ended after %s: %d extracted (%d frames), %d derived, %d skipped, %d failed, %d not finished',
              _duration(s.seconds), len(s.done), s.frames, len(s.derived), len(s.skipped), len(s.failed),
              len(s.pending))
+    if s.read_faults:
+        log.warning('%d failed reads were retried (read faults; see the WARNING lines above)', s.read_faults)
     if s.failed:
         log.error('failed videos (see .state/failed.jsonl): %s', ' '.join(s.failed))
     if s.pending:
@@ -355,7 +380,7 @@ class _Supervisor:
 
     def __init__(self, settings: Settings, out_root: Path, gpus: Sequence[int], timing: Timing, target: Callable,
                  worker_hash: str, primary_rule: Rule, derivation_hash: str, summary: RunSummary,
-                 num_videos: int) -> None:
+                 num_videos: int, clock: Callable[[], float] = time.monotonic) -> None:
         self._ctx = multiprocessing.get_context('spawn')
         self._settings = settings
         self._root = out_root
@@ -369,9 +394,14 @@ class _Supervisor:
         self._slots = [_Slot(gpu) for gpu in gpus]
         self._queue: Deque[VideoTask] = collections.deque()
         self._derives: Deque[Tuple[str, bool]] = collections.deque()   # (video, just extracted)
-        self._todo: Dict[str, int] = {}          # unfinished video -> nb_frames, for the ETA
+        self._derive_retries: Deque[Tuple[str, bool]] = collections.deque()   # tried once more at the end (D28)
+        self._retried: Set[str] = set()          # videos whose derive is (or was) in _derive_retries
+        self._backlog = 0                        # derives found at the run start, not done yet
+        self._todo: Dict[str, int] = {}          # unfinished video -> its frames (frame_count), for the ETA
         self._suspects: Dict[str, int] = collections.Counter()
         self._commits = 0
+        self._clock = clock                      # the merge timer's (time.monotonic; tests pass a fake)
+        self._last_merge = clock()               # run_extract merged just before
         self._stopping = False
         self._sampler: Optional[_GpuSampler] = None
         now = time.monotonic()
@@ -381,7 +411,8 @@ class _Supervisor:
     def run(self, tasks: Sequence[VideoTask], derives: Sequence[str]) -> None:
         self._queue.extend(tasks)
         self._derives.extend((vid, False) for vid in derives)
-        self._todo = {t.video.video_id: t.video.nb_frames for t in tasks}
+        self._backlog = len(derives)
+        self._todo = {t.video.video_id: t.video.frame_count for t in tasks}
         try:
             while self._work_left():
                 self._step()
@@ -399,7 +430,8 @@ class _Supervisor:
                     self._kill_workers()
                     if self._sampler is not None:
                         self._sampler.stop()
-                    self._summary.pending = [t.video.video_id for t in self._queue] + [vid for vid, _ in self._derives]
+                    self._summary.pending = [t.video.video_id for t in self._queue] + \
+                        [vid for vid, _ in list(self._derives) + list(self._derive_retries)]
                 finally:
                     merge_meta(self._root)   # also when stopping the workers failed
 
@@ -407,22 +439,41 @@ class _Supervisor:
     def _work_left(self) -> bool:
         if self._derives or any(s.outstanding for s in self._slots):
             return True
-        return bool(self._queue) and any(not s.stopped for s in self._slots)
+        if self._queue and any(not s.stopped for s in self._slots):
+            return True
+        if self._derive_retries:   # everything else is done: the second try of derives refused by a read fault
+            self._derives.extend(self._derive_retries)
+            self._derive_retries.clear()
+            return True
+        return False
 
     def _step(self) -> None:
         if self._derives:
-            vid, extracted = self._derives.popleft()
             with deferred_interrupt():   # a Ctrl-C held during the derive is raised after the bookkeeping
-                if _derive_video(self._root, vid, self._settings, self._rule):
-                    (self._summary.done if extracted else self._summary.derived).append(vid)
-                    self._committed()
-                else:
-                    self._summary.failed.append(vid)
+                self._derive(*self._derives.popleft())
         self._start_workers()
         self._dispatch()
         self._pump(0.0 if self._derives else 1.0)
         self._supervise()
         self._report()
+
+    def _derive(self, vid: str, extracted: bool) -> None:
+        """Derive one video and count it; a failure a later read may fix is retried once at the end."""
+        retry = vid in self._retried
+        outcome = _derive_video(self._root, vid, self._settings, self._rule, 2 if retry else 1, self._read_fault)
+        if outcome == _DERIVED:
+            (self._summary.done if extracted else self._summary.derived).append(vid)
+            self._committed()
+        elif outcome == _RETRY and not retry:
+            self._retried.add(vid)
+            self._derive_retries.append((vid, extracted))
+            log.warning('%s: its derive is tried once more when the rest of the run is done', vid)
+        else:
+            self._summary.failed.append(vid)
+        if not extracted and not retry:
+            self._backlog -= 1
+            if self._backlog == 0 and self._timing.merge_drained:   # the CSV catches up with the backlog
+                self._merge()
 
     def _start_workers(self) -> None:
         if not self._queue or self._stopping:
@@ -537,6 +588,8 @@ class _Supervisor:
                 self._committed()
             else:   # a worker's commit (extraction rule, legacy meta row): derive the final rule next
                 self._derives.append((vid, True))
+        elif ev.kind == 'read_fault':
+            self._read_fault(f'{vid}: GPU{s.gpu}: {ev.payload.get("warning")}')
         elif ev.kind == 'failed':
             task = self._finish(s, vid)
             if task is not None:
@@ -572,11 +625,21 @@ class _Supervisor:
             self._summary.failed.append(vid)
             log.error('%s: failed after %d attempts: %s', vid, task.attempt, error)
 
+    def _read_fault(self, warning: str) -> None:
+        """A verification's failed read, retried (record.Report; D28): logged and counted."""
+        log.warning('%s', warning)
+        self._summary.read_faults += 1
+
     def _committed(self) -> None:
         self._commits += 1
-        if self._commits % self._timing.merge_every == 0:
-            with deferred_interrupt():
-                merge_meta(self._root)
+        t = self._timing
+        if self._commits % t.merge_every == 0 or self._clock() - self._last_merge >= t.merge_s:
+            self._merge()
+
+    def _merge(self) -> None:
+        with deferred_interrupt():
+            merge_meta(self._root)
+        self._last_merge = self._clock()
 
     # ------------------------------------------------------------------ worker exits
     def _on_death(self, s: _Slot, reason: Optional[str], charge: bool = True) -> None:
@@ -589,7 +652,8 @@ class _Supervisor:
         if died:
             error = str(fatal.payload.get('error')) if fatal else (reason or f'worker exited with code {code}')
             tb = str(fatal.payload.get('traceback', '')) if fatal else ''
-            log.error('GPU%d: worker exited with code %s', s.gpu, code)
+            log.error('GPU%d: worker exited with code %s (C-level output, e.g. a crash message, is in '
+                      '.state/logs/decode_gpu%d_*.log)', s.gpu, code, s.gpu)
         crashed = died and charge
         culprit = fatal.video_id if fatal is not None else current
         for task in reversed(tasks):   # back to the front of the queue in their original order

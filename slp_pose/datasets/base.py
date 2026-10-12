@@ -48,12 +48,27 @@ class Video:
         path: the video file.
         split: e.g. 'train', or None. Scheduling follows Dataset.split_order.
         info: extra str columns for <out root>/video_ids.csv (e.g. the name in the annotations).
+        expected_frames: the number of frames the file really decodes to, for a source whose
+            container header states another nb_frames (truncated in the dataset's official archive,
+            so no download fixes it; D28), else None. The GPU worker then requires exactly this many
+            decoded frames instead of ffprobe's nb_frames (VideoInfo.frame_count; just as strict), so
+            such a video needs no --allow-frame-mismatch run. A positive int; never hashed. List the
+            known cases in the dataset's file (how2sign.TRUNCATED).
+        known_damage: why decoding this source prints errors (it is damaged in the dataset's own
+            archive, as read from `path`), else None. `check` reports a video whose committed
+            decode printed decoder errors (decodelog.py, D28) as a problem unless this is set; then it
+            logs them with this note. The note covers every decoder line of the video, so a read
+            fault elsewhere in such a source is not reported either (view its poses instead). A
+            non-empty str; never hashed. List the cases in the dataset's file (how2sign.DAMAGED,
+            bobsl.REPAIRED).
     """
 
     video_id: str
     path: Path
     split: Optional[str] = None
     info: Mapping[str, str] = field(default_factory=dict)
+    expected_frames: Optional[int] = None
+    known_damage: Optional[str] = None
 
 
 class Dataset:
@@ -180,9 +195,10 @@ def _check_own_rules(cls: type) -> None:
 def load_videos(dataset: Dataset) -> List[Video]:
     """dataset.videos() sorted by video_id, after checking the contract: at least one video, Video
     items, safe and unique ids, existing files, splits within split_order (when set), str info
-    values that do not shadow the fixed index columns. Raises DatasetError listing the problems,
-    or naming the path when videos() finds a source (e.g. its metadata) missing or unreadable;
-    other OSErrors (I/O faults) propagate unchanged."""
+    values that do not shadow the fixed index columns, expected_frames None or a positive int,
+    known_damage None or a non-empty str.
+    Raises DatasetError listing the problems, or naming the path when videos() finds a source (e.g.
+    its metadata) missing or unreadable; other OSErrors (I/O faults) propagate unchanged."""
     try:
         videos = list(dataset.videos())
     except (FileNotFoundError, NotADirectoryError, PermissionError) as exc:
@@ -220,6 +236,12 @@ def _video_problems(dataset: Dataset, video: Video, seen: Dict[str, Path]) -> Li
     for key, value in video.info.items():
         if key in INDEX_COLUMNS or not isinstance(key, str) or not isinstance(value, str):
             out.append(f'{vid}: info {key!r}: {value!r} must map a str other than {INDEX_COLUMNS} to a str')
+    frames = video.expected_frames
+    if frames is not None and (isinstance(frames, bool) or not isinstance(frames, int) or frames < 1):
+        out.append(f'{vid}: expected_frames {frames!r} must be None or a positive int')
+    damage = video.known_damage
+    if damage is not None and not (isinstance(damage, str) and damage.strip()):
+        out.append(f'{vid}: known_damage {damage!r} must be None or a non-empty str')
     return out
 
 

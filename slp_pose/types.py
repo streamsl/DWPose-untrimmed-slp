@@ -32,7 +32,12 @@ POSED = 4      # was posed (at most K per frame, always a subset of POSE_SET)
 
 @dataclass(frozen=True)
 class VideoInfo:
-    """What ffprobe says about one video (spec §4.1: T = nb_frames)."""
+    """What ffprobe says about one video (spec §4.1: T = nb_frames), and the frame count the dataset
+    expects instead when the container's nb_frames is wrong (D28).
+
+    Picklable into a respawned worker of an older parent: fields are only ever added at the end with
+    a plain default (an older pickle then reads the class default; tests/test_pickle_compat.py).
+    """
 
     path: Path
     video_id: str
@@ -43,15 +48,24 @@ class VideoInfo:
     nb_frames: int
     codec: str
     size_bytes: int
+    # datasets.Video.expected_frames (D28): the frames the file really decodes to when ffprobe's
+    # nb_frames is wrong (a source truncated in its official archive); None = nb_frames. Not hashed.
+    expected_frames: Optional[int] = None
 
     @property
     def fps(self) -> float:
         return self.fps_num / self.fps_den
 
     @property
+    def frame_count(self) -> int:
+        """T, the decoded frame count the reader requires: expected_frames when the dataset sets it,
+        else ffprobe nb_frames."""
+        return self.nb_frames if self.expected_frames is None else self.expected_frames
+
+    @property
     def duration_s(self) -> float:
         """T * den / num, the value written to video_meta.csv."""
-        return self.nb_frames * self.fps_den / self.fps_num
+        return self.frame_count * self.fps_den / self.fps_num
 
 
 @dataclass
