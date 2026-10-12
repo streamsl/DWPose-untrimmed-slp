@@ -130,9 +130,10 @@ class RightTrackParams:
     def fingerprint(self) -> Dict[str, object]:
         """The flat dict hashed into the derivation hash (VideoRule.params): the track's, the motion
         measure's and this rule's own parameters in one dict (D21's keys as signer.rule_params gave
-        them before D22, plus D24's; the one point_conf is both the track's and the motion's)."""
+        them before D22, plus D24's; the one point_conf is both the track's and the motion's; D29's
+        step-5 gate is off, so SignerTrackParams.fingerprint leaves its fields out)."""
         own = {name: getattr(self, name) for name in ('min_active', 'fill_gaps', 'fill_min_s', 'fill_cover')}
-        return dict(dataclasses.asdict(self.track), **dataclasses.asdict(self.motion), **own)
+        return dict(self.track.fingerprint(), **dataclasses.asdict(self.motion), **own)
 
 
 PARAMS = RightTrackParams()
