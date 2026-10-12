@@ -9,7 +9,9 @@ Repaired sources (D26): an episode in REPAIRED is damaged in the official BOBSL 
 else from the original. The repaired copy has the same frames, frame size and frame rate, with the
 damaged frames painted black (lossless H.264; BOBSL/repaired/README.txt says how it was made and
 checked). The extractor finds nobody on a black frame, so those frames are stored as empty (no
-signer). Publish a repaired copy under a temporary name and rename it into place.
+signer). Publish a repaired copy under a temporary name and rename it into place. An episode read
+from its damaged original (no repaired copy) is declared damaged (Video.known_damage, D28): `check`
+then expects decoder errors from it.
 """
 from __future__ import annotations
 
@@ -20,13 +22,18 @@ from typing import Dict, List, Tuple
 from . import register
 from .base import Dataset, Video
 
-# Episode id -> its damaged frames as half-open [start, stop) runs: every frame whose packets overlap
-# the zero bytes in the source, through the next IDR keyframe.
+# Episode id -> the frames its repaired copy paints black, as half-open [start, stop) runs: every frame
+# that depends on damaged data (its packets overlap the zero bytes, or it references a frame that does),
+# through the next IDR keyframe.
 REPAIRED: Dict[str, Tuple[Tuple[int, int], ...]] = {
-    # sha256 30745d5a... (the same bytes in bobsl_v1_4_videos_mp4.tar): two 1,044,480-byte zero runs at
-    # offsets 169,713,664 and 172,859,392; OpenCV stops at frame 71,837 of 90,577. 1,282 frames damaged.
-    '5976836975695491321': ((71840, 72447), (73259, 73934)),
+    # sha256 30745d5a... (the same bytes in bobsl_v1_4_videos_mp4.tar): two 1,048,576-byte zero runs at
+    # offsets 169,711,104 and 172,856,832; OpenCV stops at frame 71,837 of 90,577. 1,287 frames black in
+    # the copy rebuilt for D28 (the first copy, D26, froze 71837-71839 and 73257-73258 on the frame before
+    # instead and listed 1,282; BOBSL/repaired/README.txt says which copy is in place).
+    '5976836975695491321': ((71837, 72447), (73257, 73934)),
 }
+_DAMAGED_ORIGINAL = ('damaged in the official BOBSL v1.4 archive (zero runs; bobsl.REPAIRED) and read from the '
+                     'original, as BOBSL/repaired/ has no copy of it: libav reports decoding errors')
 
 
 @register
@@ -51,7 +58,13 @@ class Bobsl(Dataset):
     def videos(self) -> List[Video]:
         splits = self._splits()
         paths = sorted((self.source / 'videos' / 'mp4').glob('*.mp4'))
-        return [Video(path.stem, self._repaired(path), splits.get(path.stem)) for path in paths]
+        out = []
+        for path in paths:
+            source = self._repaired(path)
+            damaged = path.stem in REPAIRED and source == path
+            out.append(Video(path.stem, source, splits.get(path.stem),
+                             known_damage=_DAMAGED_ORIGINAL if damaged else None))
+        return out
 
     def _repaired(self, path: Path) -> Path:
         """The repaired copy of a REPAIRED episode when that file exists, else `path`."""

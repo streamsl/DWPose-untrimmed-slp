@@ -211,6 +211,13 @@ SIGNER_TRACK_RIGHT = VideoRule('signer_track_right', _choose, PARAMS.fingerprint
 
 
 # --------------------------------------------------------------------------- the dataset
+# Video id -> why decoding it prints errors (Video.known_damage, D28): damaged as downloaded.
+DAMAGED: Dict[str, str] = {
+    'abc_news_2022-09-11': 'one damaged macroblock in frame 2753 (91.9 s) since the original download, about '
+                           '120 px from the interpreter (2026-10-04 audit; poses unaffected)',
+}
+
+
 @register
 class AuslanNews(Dataset):
     """News_V1 + News_V2; split = the V1 workbook's split (None for V2); info: subset, annotation_name."""
@@ -233,8 +240,9 @@ class AuslanNews(Dataset):
         out = []
         for path in sorted(self.source.glob('News_V[12]/*.mp4')):
             subset, name = path.parent.name, annotation_name(path)
-            out.append(Video(video_id(path), path, splits.get(name) if subset == 'News_V1' else None,
-                             dict(subset=subset, annotation_name=name)))
+            vid = video_id(path)
+            out.append(Video(vid, path, splits.get(name) if subset == 'News_V1' else None,
+                             dict(subset=subset, annotation_name=name), known_damage=DAMAGED.get(vid)))
         return out
 
 

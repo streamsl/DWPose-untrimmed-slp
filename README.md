@@ -3,7 +3,7 @@
 `slp-pose` (Python package `slp_pose`, repository `DWPose-untrimmed-slp`) runs DWPose on every frame
 of full-length sign-language videos and writes one keypoint array per video for the signer, in the
 `youtube-sl-25` pose schema that [`misaligned-slt`](#6-using-the-outputs-in-misaligned-slt) reads.
-A dataset is one Python file; BOBSL and Auslan-Daily News are built in.
+A dataset is one Python file; BOBSL, Auslan-Daily News and How2Sign are built in.
 
 1. [What it does](#1-what-it-does)
 2. [Install on a fresh Linux machine](#2-install-on-a-fresh-linux-machine-with-an-nvidia-gpu)
@@ -39,7 +39,7 @@ Outputs, under the dataset's output root:
 
 | File | Content |
 |---|---|
-| `poses/<vid>.npy` | `(T, 133, 3)` float32. `T` = decoded frames = ffprobe `nb_frames`, native fps, no resampling. COCO-WholeBody order: 0–16 body, 17–22 feet, 23–90 face, 91–111 left hand, 112–132 right hand (the person's own left and right). Channel 0 = `x / W`, channel 1 = `y / H` of the original frame, channel 2 = the raw DWPose SimCC score (never clipped; it can exceed 1). A frame with no signer is all zeros. |
+| `poses/<vid>.npy` | `(T, 133, 3)` float32. `T` = decoded frames = ffprobe `nb_frames` (or, for a source truncated in its dataset's archive, the dataset's `Video.expected_frames`), native fps, no resampling. COCO-WholeBody order: 0–16 body, 17–22 feet, 23–90 face, 91–111 left hand, 112–132 right hand (the person's own left and right). Channel 0 = `x / W`, channel 1 = `y / H` of the original frame, channel 2 = the raw DWPose SimCC score (never clipped; it can exceed 1). A frame with no signer is all zeros. |
 | `persons/<vid>.npz` | The raw record: every person candidate (detector score > 0.1) with its box, score and count/pose-set flags; keypoints of the posed people (up to 3 per frame); the signer's index per frame (`kpt_primary`, -1 = none); the meta row; and provenance (git sha, hashes, engine and checkpoint sha256, library versions, GPU). `poses/` and the meta row are pure functions of it. |
 | `video_meta.csv` | `video_id,duration_s,width,height,caption_source,undetected_ratio,masked_runs,empty_runs,handless_runs`, byte-identical to what misaligned-slt's `save_video_meta` writes. `duration_s = T * den / num` from the exact frame rate, so `T / duration_s` gives back the fps. `caption_source` is blank. `undetected_ratio` is the share of frames with nobody in the detector's count set. The three run columns are JSON lists of half-open `[a, b]` frame runs of `poses/` (`[]` = none), computed with the algorithm and constants of misaligned-slt's `prepare_yt25.py` at commit 3eb85af (`meta.MSLT_COMMIT`). The constants are in seconds, converted to frames at the video's own rate: 0.5 s to merge or keep a masked run, 1 s for an empty run, 2 s motion windows, i.e. 13 / 25 / 50 frames at 25 fps and 15 / 30 / 60 at 29.97 fps. `masked_runs` = frames where a second real body (8 or more visible body joints) is present and moves its arms: the standard deviation of its elbows and wrists over a 2 s window is above 0.7 of the signer's shoulder width, or cannot be measured. Each other body is followed as one person by where its shoulders are, not by its detector rank; `empty_runs` = frames whose `poses/` row holds no real body (no signer, or too few visible joints); `handless_runs` = frames whose `poses/` row shows no hand (fewer than 10 of 21 points above 0.3). misaligned-slt cuts masked and empty runs out of the stream and quarantines captions that lie mostly in handless runs. With a per-frame signer rule every posed person counts for `masked_runs`; with a video-level rule (`signer_track`, `signer_track_right`: BOBSL, Auslan News) only the posed people whose box centre lies in the interpreter's region (the box of the signer spot the rule used in that frame), so programme footage elsewhere on screen is not cut. The extraction commits each video with an older meta row (no run columns), and the parent derives it right after, so a row with blank run cells only appears for a video that is committed but not derived yet. |
 | `video_ids.csv` | `video_id,split,source`, then the dataset's own columns. `source` is relative to the data root (absolute for a file outside it). It is rewritten at every `extract` start. |
@@ -224,9 +224,10 @@ slp-pose extract --dataset auslan_news --gpus 0,1
 - **Commits:** a video is committed atomically when it is finished. The extraction rule poses the
   people, then the parent derives the signer with the primary rule on the CPU.
 - **Progress:** one progress line a minute (videos, fps per GPU, ETA). `video_meta.csv` is merged
-  when the run starts, every 50 commits, and when it ends (also after Ctrl-C, SIGTERM or an error),
-  so it lists every committed video. A run that was killed outright (SIGKILL, a crash) is caught up
-  by the next run's first merge.
+  when the run starts, every 50 commits, at the first commit 30 minutes after the last merge, once
+  the derives the run found at its start are done, and when it ends (also after Ctrl-C, SIGTERM or
+  an error), so it lists every committed video and lags a long run by at most about 30 minutes. A
+  run that was killed outright (SIGKILL, a crash) is caught up by the next run's first merge.
 - **Resume:** re-run the same command. Committed videos are skipped. A video whose signer rule,
   count-set thresholds or `video_meta.csv` definitions changed is re-derived on the CPU
   (`render-done` renders it again only where the signer rows or the people counts change); one
@@ -241,10 +242,31 @@ slp-pose extract --dataset auslan_news --gpus 0,1
 - **Failures:** a video gets 2 attempts, and each failed attempt is a line in `.state/failed.jsonl`.
   A worker that crashes, or that is silent for 10 min, is respawned (up to 3 times an hour per GPU).
   The exit code is 1 when any video failed or is still pending.
+- **Read faults:** a disk can return a wrong byte now and then (an overheating one does). Every
+  check that reads a file to verify it (the CRC-32 of `persons/`, `derive`'s second read, the
+  comparison of `poses/` with `persons/`, a worker's check of its commit) reads a failure again
+  after dropping the file from the page cache (`posix_fadvise`), up to 3 reads, and believes it
+  only when every read fails; it then fails as before. Each retried read is a WARNING line, and the
+  run's last lines count them. A `derive` that still fails for such a reason (a CRC failure, a
+  second read that differs, or an OSError) is tried once more when the rest of the run is done.
+  On an ntfs-3g (`fuseblk`) mount the immediate re-reads do not reach the disk: ntfs-3g reads
+  through the block device's page cache, which only root can drop, so a wrong byte the disk
+  delivered comes back while it stays cached. There the end-of-run derive retry and a later `check`
+  are the real second reads; before re-extracting a video that failed so, drop the caches
+  (`sudo sh -c 'sync; echo 1 > /proc/sys/vm/drop_caches'`) and run `check` on it again.
+- **Decoder errors:** what libav and OpenCV print in a worker (its file descriptor 2) goes to
+  `.state/logs/decode_gpu<N>_<time>.log`, with a `BEGIN <vid> attempt <k>` / `END <vid>` line
+  around each video it decodes and `COMMIT <vid>` after each commit, so the error lines of a
+  damaged source (or of a bad read of it) name their video. `check` reports them. The workers'
+  Python messages still go to the command's stdout and stderr, but anything else a worker's C code
+  prints (TensorRT, CUDA, a crash message) also lands in its decode log.
 - **Lock:** one `extract` or `derive` at a time per output root (`.state/lock`).
-- **Options:** `--videos ID ...` and `--limit N` restrict the run; `--backend torch` uses PyTorch
-  instead of TensorRT (slower); `--allow-frame-mismatch` accepts a decoded frame count that differs
-  from ffprobe's.
+- **Options:** `--videos ID ...` and `--limit N` restrict the run (an id that starts with `-` is
+  passed as `--videos=<id>`, one per option); `--backend torch` uses PyTorch instead of TensorRT
+  (slower); `--allow-frame-mismatch` accepts a decoded frame count that differs from ffprobe's, for
+  the whole run. For a source known to be truncated, the dataset can instead state the frame count
+  it decodes to (`Video.expected_frames`, [below](#4-adding-a-dataset)), which is checked as
+  strictly as ffprobe's.
 
 Long runs are best started detached, so that they survive the terminal:
 
@@ -257,6 +279,7 @@ Run state in `<out root>/.state/`:
 | Path | Content |
 |---|---|
 | `logs/<command>_<time>.log` | the log of each command run on this root, also printed on stdout (`render-done` logs to its vis dir and `parity` to its report dir instead) |
+| `logs/decode_gpu<N>_<time>.log` | what the decoder (libav, OpenCV) of the `extract` worker on GPU N printed, with BEGIN / END / COMMIT lines per video |
 | `failed.jsonl` | failed attempts |
 | `gpu.csv` | `nvidia-smi` samples every 10 s |
 | `done/<vid>.json` | commit markers |
@@ -278,10 +301,19 @@ Checks every committed video:
   definitions) gets one line instead, `derived by other code (meta_version 4, ...)`, because its
   signer picks and meta row follow the older rules. That is not damage: run `derive`;
 - that the video was derived with the dataset's primary rule;
+- that decoding the video printed no decoder errors when it was extracted (the worker's decode log,
+  [above](#extract)): otherwise `decoder errors while extracting (N lines): <first line>`. Only
+  libav's lines (`[h264 @ 0x...] ...`) and OpenCV's video I/O warnings count; other lines the
+  worker printed meanwhile get an info line. A source the dataset declares damaged
+  (`Video.known_damage`) only gets an info line, whatever its decoder printed;
 - primary-signer switches (frames where the signer's box jumps). For these it prints `render`
   commands for the windows worth reviewing.
 
-The exit code is 1 when any video has a problem.
+A CRC failure or a difference between `poses/` and `persons/` is read again (up to 3 reads, after
+dropping the files from the page cache) before it is reported; a read that passes on a retry is a
+WARNING line. On an ntfs-3g mount these re-reads come from the block device's cache, not the disk
+([above](#extract)): run `check` again after dropping the caches before treating such a problem as
+damage. The exit code is 1 when any video has a problem.
 
 ### derive
 
@@ -436,7 +468,7 @@ contract below without touching a GPU.
 
 - a path ending in `.py`: that file, which must define (or `@register`) exactly one `Dataset`
   subclass;
-- a built-in name: `bobsl`, `auslan_news` (`slp_pose/datasets/`);
+- a built-in name: `bobsl`, `auslan_news`, `how2sign` (`slp_pose/datasets/`);
 - `package.module:ClassName`: that class of an importable module;
 - an installed plugin: an entry point in the group `slp_pose.datasets`, named after the dataset. In
   the plugin package's `pyproject.toml`:
@@ -459,6 +491,16 @@ videos and runs every command on them.
 | `extraction_rule` | The per-frame rule the GPU workers pose with. `None` = `primary_rule`, which must then be per-frame. |
 | `rules` | The dataset's own signer rules ([below](#rules-of-your-own)), a tuple of `FrameRule` and `VideoRule`. Default none: only the framework's rules. |
 | `split_order` | When set, splits are extracted in this order (videos without a split last), and every `split` must be one of them or None. |
+
+Two optional `Video` fields describe sources that are damaged in the dataset's own archive. Neither
+enters a hash or an output file.
+
+| `Video` field | Meaning |
+|---|---|
+| `expected_frames` | For a source whose header states more frames than its data holds (truncated in the archive itself): the number of frames it does decode to, a positive int. The worker then requires exactly that count instead of ffprobe's `nb_frames`, so the video needs no `--allow-frame-mismatch` run. |
+| `known_damage` | For a source that prints decoder errors on every read: a note on why. `check` then logs its decoder errors as expected instead of reporting them (all of them: a read fault elsewhere in that source is not reported either). |
+
+List such cases in the dataset's file, as `how2sign.py` (`TRUNCATED`, `DAMAGED`) and `bobsl.py` do.
 
 If you will use the outputs in misaligned-slt, avoid dots in video ids: it finds captions by
 cutting `<vid>.<lang>.vtt` at the first dot.
@@ -538,19 +580,20 @@ class LeftSigner(Dataset):
 
 ## 5. Built-in datasets
 
-Both datasets keep the interpreter only. A frame where no interpreter is on screen is stored as
-zeros, even when other people are posed (they stay in `persons/`).
+BOBSL and Auslan-Daily keep the interpreter only. A frame where no interpreter is on screen is
+stored as zeros, even when other people are posed (they stay in `persons/`). In How2Sign one signer
+is alone in front of a green screen.
 
-| | BOBSL (`bobsl`) | Auslan-Daily News V1 + V2 (`auslan_news`) |
-|---|---|---|
-| Videos | 2,212 BBC episodes, 149.4 M frames, 444x444, 25 fps | 125 ABC news broadcasts (V1: 45, 2022–2023; V2: 80, 2023–2025), 5.65 M frames, 1280x720 (six 2025 V2 videos: 1024x576), 29.97 fps (V1) or 25 fps (V2) |
-| Video id | the episode id (file stem), e.g. `5085344787448740525` | `abc_news_YYYY-MM-DD` |
-| Splits | `val` 32, `test` 250, `train` 1658, `challenge_test` 272 (extracted in this order) | V1 from the annotation workbook: `dev` 4, `test` 6, `train` 35; V2: none |
-| `video_ids.csv` extras | none | `subset` (`News_V1` / `News_V2`) and `annotation_name`: the workbook's `D_M_YYYY` for V1, the file stem (the VTT name) for V2 |
-| Rules | extraction `largest_bbox`, primary `signer_track` | extraction `right_largest`, primary `signer_track_right` (its own rules, in `auslan_news.py`) |
-| Signer policy | the in-vision interpreter at their usual position. While the interpreter is off screen the frame is zeros, not a programme person. | the interpreter in the right-hand panel, or centred full screen at the end of a broadcast. A change of interpreter mid-video counts as one signer. An on-site interpreter beside a press-conference speaker is kept as the signer, also while the panel interpreter is off screen, and so is a picture-in-picture interpreter while the panel is gone; the frames between the inset's showings stay zeros, even when a signing interviewee fills the screen. A still speaker, officer or newsreader is not picked. |
-| Output root | `<data root>/BOBSL/dwpose/` | `<data root>/Auslan-Daily/dwpose/` |
-| Runtime, 2x RTX 3090 Ti | about 100 fps per GPU, about 8.5 days | about 75 fps per GPU (median per video, range 58–88; measured with `render-done` running beside it), about 10 h |
+| | BOBSL (`bobsl`) | Auslan-Daily News V1 + V2 (`auslan_news`) | How2Sign (`how2sign`) |
+|---|---|---|---|
+| Videos | 2,212 BBC episodes, 149.4 M frames, 444x444, 25 fps | 125 ABC news broadcasts (V1: 45, 2022–2023; V2: 80, 2023–2025), 5.65 M frames, 1280x720 (six 2025 V2 videos: 1024x576), 29.97 fps (V1) or 25 fps (V2) | 2,529 frontal raw videos (`rgb_front`), 79.1 h, 7.22 M frames, 1280x720 (three 1920x1080), each at its own native rate: 24 fps for 86 %, also 23.976, 30, 50 and 60 fps |
+| Video id | the episode id (file stem), e.g. `5085344787448740525` | `abc_news_YYYY-MM-DD` | How2Sign's `VIDEO_NAME` (the file stem), e.g. `--7E2sU6zP4-5-rgb_front`, so the sentence timings join on it. 170 ids start with `-`: pass such an id as `--videos=<id>` (one per option), or select with `--limit` |
+| Splits | `val` 32, `test` 250, `train` 1658, `challenge_test` 272 (extracted in this order) | V1 from the annotation workbook: `dev` 4, `test` 6, `train` 35; V2: none | the folder: `val` 132, `test` 184, `train` 2213 (extracted in this order) |
+| `video_ids.csv` extras | none | `subset` (`News_V1` / `News_V2`) and `annotation_name`: the workbook's `D_M_YYYY` for V1, the file stem (the VTT name) for V2 | none |
+| Rules | extraction `largest_bbox`, primary `signer_track` | extraction `right_largest`, primary `signer_track_right` (its own rules, in `auslan_news.py`) | extraction and primary `largest_bbox` |
+| Signer policy | the in-vision interpreter at their usual position. While the interpreter is off screen the frame is zeros, not a programme person. | the interpreter in the right-hand panel, or centred full screen at the end of a broadcast. A change of interpreter mid-video counts as one signer. An on-site interpreter beside a press-conference speaker is kept as the signer, also while the panel interpreter is off screen, and so is a picture-in-picture interpreter while the panel is gone; the frames between the inset's showings stay zeros, even when a signing interviewee fills the screen. A still speaker, officer or newsreader is not picked. | the largest person, who is the signer: in a pilot of 13 videos (27,175 frames) exactly one person was found in every frame, and `signer_track` wrongly dropped 14 of those signer frames, so the simple rule is the right one. |
+| Output root | `<data root>/BOBSL/dwpose/` | `<data root>/Auslan-Daily/dwpose/` | `<data root>/How2Sign/dwpose/` |
+| Runtime, 2x RTX 3090 Ti | about 100 fps per GPU, about 8.5 days | about 75 fps per GPU (median per video, range 58–88; measured with `render-done` running beside it), about 10 h | about 100 fps per GPU, about 10 h |
 
 Place the data under the data root like this:
 
@@ -561,15 +604,29 @@ Place the data under the data root like this:
 <data root>/Auslan-Daily/News_V1/ABC News With Auslan - D M YYYY.mp4
 <data root>/Auslan-Daily/News_V1_Annotation.xlsx                  splits (its 'EA<n>' Web News rows are skipped)
 <data root>/Auslan-Daily/News_V2/ABC News With Auslan - D M YYYY.mp4
+
+<data root>/How2Sign/{val,test,train}/<VIDEO_NAME>.mp4            the frontal raw videos
+<data root>/How2Sign/how2sign_realigned_{val,test,train}.csv      sentence timings (not read by slp-pose)
 ```
 
+How2Sign's frame rates are kept: each video is stored at its own rate, which misaligned-slt reads
+as T / `duration_s` from `video_meta.csv` (as for Auslan-Daily's two rates).
+
 One BOBSL episode, `5976836975695491321`, is damaged in the official v1.4 copy itself (two runs of
-zero bytes; decoders stop at frame 71,837 of 90,577). `bobsl.py` reads it from
-`<data root>/BOBSL/repaired/5976836975695491321.mp4` when that file exists, else from the original.
-The repaired copy has the same 90,577 frames at 25 fps, with the 1,282 damaged frames
-([71840, 72447) and [73259, 73934), listed in `bobsl.REPAIRED`) painted black. Those frames are
+1,048,576 zero bytes at offsets 169,711,104 and 172,856,832; decoders stop at frame 71,837 of
+90,577). `bobsl.py` reads it from `<data root>/BOBSL/repaired/5976836975695491321.mp4` when that
+file exists, else from the original (declared damaged then, so `check` expects its decoder errors).
+The repaired copy has the same 90,577 frames at 25 fps, with the 1,287 frames that depend on damaged
+data ([71837, 72447) and [73257, 73934), listed in `bobsl.REPAIRED`) painted black. Those frames are
 stored as empty (no signer). `video_ids.csv` shows the path that was used. Publish such a copy under
 a temporary name and rename it into place.
+
+Two How2Sign sources are damaged as distributed. `cH27PiYX6gI-9-rgb_front` (train) is truncated in
+the official archive: its header lists 4,340 frames but its data ends after 4,088 (the last 10.5 s;
+every sentence ends by 136.7 s). `how2sign.TRUNCATED` gives the worker those 4,088 frames to expect,
+so the normal run extracts it (before, it needed `--allow-frame-mismatch`).
+`G3RvsnzQrXQ-10-rgb_front` has one damaged block near frame 1988 (82.8 s). Both are listed in
+`how2sign.DAMAGED`, so `check` logs their decoder errors as expected.
 
 Only the TV news part of Auslan-Daily is used. The Communication and Web News parts are left out
 because they have too many multi-person videos. The BOBSL licence keeps its outputs local.
@@ -624,7 +681,9 @@ Things to know before training:
   it raises when their videos' rates give different frame counts. Auslan News V1 is 29.97 fps and
   V2 is 25 fps, so they cannot share a pool. Keep V2 out of the splits (as it is now), or register
   V1 and V2 as two languages with separate roots. A per-subset output root would belong in
-  `slp_pose/datasets/auslan_news.py`. BOBSL is 25 fps throughout.
+  `slp_pose/datasets/auslan_news.py`. BOBSL is 25 fps throughout. How2Sign mixes five rates in one
+  dataset (24 fps for 86 % of its videos), so its pool needs misaligned-slt to accept mixed rates,
+  or a split of the pool by rate.
 - **Captions:** put them at `<root>/subs/<video_id>.<lang>.vtt` (`.en.vtt` for English). Videos
   without one are dropped. BOBSL's subtitles and Auslan News V1's workbook need converting first.
 - **Splits:** misaligned-slt takes them from the one CSV that `splits.signverse_csv` names, and
@@ -661,7 +720,7 @@ which ends with `scripts/check_env.py`). A new TensorRT also has to go into `slp
 |---|---|
 | `slp_pose/cli.py`, `__main__.py` | the `slp-pose` command line |
 | `slp_pose/settings.py`, `paths.py` | `Settings` (thresholds, batches, precision, model paths); data root and models directory resolution |
-| `slp_pose/datasets/` | the dataset contract (`base.py`), registry and resolution (`__init__.py`), `bobsl.py`, `auslan_news.py` |
+| `slp_pose/datasets/` | the dataset contract (`base.py`), registry and resolution (`__init__.py`), `bobsl.py`, `auslan_news.py`, `how2sign.py` |
 | `slp_pose/env.py` | start-up checks: pinned versions, which mmpose copy is imported, `CUDA_DEVICE_ORDER`, TF32 off |
 | `slp_pose/fetch.py` | `fetch-models` |
 | `slp_pose/engines.py` | model building, ONNX export, TensorRT build, TensorRT and torch engines |
@@ -670,6 +729,7 @@ which ends with `scripts/check_env.py`). A new TensorRT also has to go into `slp
 | `slp_pose/select.py`, `signer.py`, `rules.py` | the framework's per-frame and video-level signer rules and their building blocks; rules by name |
 | `slp_pose/record.py`, `meta.py`, `types.py` | the `persons/` record, `poses/` derivation, commit and resume, `video_meta.csv`; shared types |
 | `slp_pose/worker.py`, `run.py` | one worker per GPU; scheduling, supervision and the CSV merge |
+| `slp_pose/decodelog.py` | the workers' decode logs: which video's decoding printed errors (for `check`) |
 | `slp_pose/render.py`, `render_batch.py` | `render` and `render-done` |
 | `slp_pose/parity.py` | the parity gate |
 | `slp_pose/model_configs/` | the YOLOX and DWPose configs, shipped as package data and never edited (their sha256 is in the extraction hash) |

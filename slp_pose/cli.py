@@ -28,8 +28,11 @@ Commands and options (argparse; defaults in brackets):
                  -> record.derive per video (the current meta row, D19), then run.merge_meta (run.run_derive).
   check          --dataset --out-root --videos ID... [all committed] --no-crc
                  -> record.check per video (rules resolved by the dataset; the CRC-32 of every persons/
-                 member unless --no-crc), plus record.derivation_problems
-                 (outputs not derived with the dataset's primary rule, count settings and current meta definitions);
+                 member unless --no-crc; failed reads retried, D28), plus record.derivation_problems
+                 (outputs not derived with the dataset's primary rule, count settings and current meta definitions)
+                 and the decoder errors of the video's committed decode (decodelog.is_decoder_line lines of
+                 decodelog.printed_lines, D28; logged only, for a source the dataset declares damaged:
+                 Video.known_damage; the worker's other stderr lines are logged as info);
                  prints problems and render commands for the suggested windows; exit code 1 on problems.
   render         VIDEO_ID --dataset --out-root --start-s S [0] --duration-s S [30] | --full --persons
                  --out PATH [<out-root>/renders/<vid>_<start frame>.mp4, <vid>_full.mp4 with --full]
@@ -249,10 +252,12 @@ def _check(args: argparse.Namespace) -> int:
     dataset = _dataset(args)
     root = _out_root(args, dataset)
     _setup_logging(root, 'check')
-    from . import record
+    from . import decodelog, record
     from .run import committed_videos
     from .video import probe
-    sources = _video_paths(dataset)
+    videos = {video.video_id: video for video in load_videos(dataset)}
+    sources = {vid: Path(video.path) for vid, video in videos.items()}
+    printed = decodelog.printed_lines(root)
     settings = _settings(args)
     bad = 0
     for vid in args.videos or committed_videos(root):
@@ -264,6 +269,18 @@ def _check(args: argparse.Namespace) -> int:
             log.error('%s: cannot check: %s: %s', vid, type(exc).__name__, exc)
             bad += 1
             continue
+        lines = printed.get(vid, [])
+        errors = [line for line in lines if decodelog.is_decoder_line(line)]
+        other = [line for line in lines if not decodelog.is_decoder_line(line)]
+        damage = videos[vid].known_damage if vid in videos else None
+        if errors and damage:
+            log.info('%s: %d decoder error lines while extracting, expected (%s): %s', vid, len(errors), damage,
+                     errors[0])
+        elif errors:
+            problems.append(decodelog.problem(errors))
+        if other:   # not the decoder's (decodelog.py): e.g. TensorRT or CUDA printing during the decode
+            log.info('%s: %d other lines on the GPU worker\'s stderr while it decoded the video: %s', vid,
+                     len(other), other[0])
         if problems:
             bad += 1
             log.error('%s: %d problems', vid, len(problems))

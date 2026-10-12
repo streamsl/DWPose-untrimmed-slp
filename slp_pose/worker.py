@@ -13,6 +13,11 @@ Protocol with the parent (run.py is the other side):
   and survives a later crash.
 - SIGINT / SIGTERM, or the death of the parent, request a stop: the worker stops at the next chunk
   boundary (never inside a commit), deletes the unfinished spill and sends 'exit'.
+- Decoder errors (D28): from its first task on, the worker's file descriptor 2 (where libav and
+  OpenCV print, from C) is its decode log <out_root>/.state/logs/decode_gpu<N>_<stamp>.log, with
+  BEGIN / END markers around each video the reader decodes and COMMIT after each commit
+  (decodelog.py), so `check` can name the videos whose decoding printed errors. Python's
+  sys.stderr keeps writing to the old stderr.
 """
 from __future__ import annotations
 
@@ -35,6 +40,7 @@ from typing import TYPE_CHECKING, Callable, ContextManager, Dict, Iterator, List
 import numpy as np
 
 from . import env
+from .decodelog import DecodeLog
 from .settings import Settings
 from .types import NUM_KEYPOINTS, Chunk, ChunkDets, ChunkPoses, VideoInfo
 
@@ -156,6 +162,8 @@ class WorkerEvent:
       'progress'  heartbeat, every HEARTBEAT_S s while the worker makes progress or waits for
                   work (a hung worker goes silent); frames = frames done in the current video
       'done'      payload = dataclasses.asdict(record.CommitInfo)
+      'read_fault' the commit's verification read the video's spill again after a failed read (D28;
+                  record.SpillWriter); payload {'warning'}. Sent before the video's 'done' or 'failed'
       'failed'    per-video failure, worker continues; payload {'error', 'traceback', 'attempt'}
       'fatal'     the worker cannot continue (CUDA/TensorRT error, failed setup); payload
                   {'error', 'traceback'}; video_id = the video in progress; exit code 3
@@ -263,10 +271,11 @@ class _TaskFeed:
     Remembers the tasks handed out and not yet finished, so a failure can be attributed.
     """
 
-    def __init__(self, tasks, send: _EventSender, stop: threading.Event) -> None:
+    def __init__(self, tasks, send: _EventSender, stop: threading.Event, decode_log: DecodeLog) -> None:
         self._tasks = tasks
         self._send = send
         self._stop = stop
+        self.decode_log = decode_log
         self._next: Optional[VideoTask] = None   # taken from the queue, not yet handed out
         self._ended = False
         self._claimed: Dict[str, VideoTask] = {}
@@ -281,16 +290,23 @@ class _TaskFeed:
 
     def videos(self, allow_frame_mismatch: bool) -> Iterator[VideoInfo]:
         """The input of one ChunkReader: videos of consecutive tasks that share `allow_frame_mismatch`
-        (a reader has a single setting); runs in the reader's decode thread."""
+        (a reader has a single setting); runs in the reader's decode thread, which decodes a video
+        between the yield and the next request, so the decode-log markers bracket its decoding."""
         while True:
             task = self.peek()
             if task is None or self._stop.is_set() or task.allow_frame_mismatch != allow_frame_mismatch:
                 return
             self._next = None
+            vid = task.video.video_id
             with self._lock:
-                self._claimed[task.video.video_id] = task
-            self._send('claimed', task.video.video_id, payload={'attempt': task.attempt})
-            yield task.video
+                self._claimed[vid] = task
+            self._send('claimed', vid, payload={'attempt': task.attempt})
+            self.decode_log.open(Path(task.out_root))
+            self.decode_log.mark('BEGIN', vid, task.attempt)
+            try:
+                yield task.video
+            finally:
+                self.decode_log.mark('END', vid)
 
     def task(self, video_id: str) -> VideoTask:
         with self._lock:
@@ -426,7 +442,10 @@ class _VideoLoop:
         if self._task is not None:   # the reader always ends a video first; never leave one open
             self._fail(self._task, 'a new video started before this one ended', '')
         rule = task_rule(task)
-        self._spill = record.SpillWriter(Path(task.out_root), task.video, rule)
+        vid = task.video.video_id
+        # Read faults go to the parent, which logs and counts them.
+        self._spill = record.SpillWriter(Path(task.out_root), task.video, rule,
+                                         report=lambda text: self._send('read_fault', vid, payload={'warning': text}))
         self._task, self._rule, self._t0, self.frames = task, rule, time.time(), 0
         self._send('started', task.video.video_id, payload={'attempt': task.attempt})
 
@@ -436,6 +455,7 @@ class _VideoLoop:
         seconds = self.seconds
         self._task = self._spill = self._rule = None
         self._feed.finish(task.video.video_id)
+        self._feed.decode_log.mark('COMMIT', task.video.video_id)
         self.activity += 1
         self._send('done', task.video.video_id, info.num_frames, seconds, dataclasses.asdict(info))
 
@@ -512,7 +532,8 @@ def run_worker(gpu: int, settings: Settings, tasks, events, setup: Callable[[Set
     """
     stop = threading.Event()
     send = _EventSender(events, gpu, stop)
-    feed = _TaskFeed(tasks, send, stop)
+    decode_log = DecodeLog(gpu)
+    feed = _TaskFeed(tasks, send, stop, decode_log)
     loop: Optional[_VideoLoop] = None
     with _stop_on_signals(stop):
         try:
@@ -530,6 +551,8 @@ def run_worker(gpu: int, settings: Settings, tasks, events, setup: Callable[[Set
             sys.stdout.flush()
             sys.stderr.flush()
             os._exit(EXIT_FATAL)
+        finally:
+            decode_log.close()
     send('exit', payload={'interrupted': stop.is_set()})
 
 

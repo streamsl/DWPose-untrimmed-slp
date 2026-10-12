@@ -35,7 +35,7 @@ __all__ = ['BUILTIN', 'ENTRY_POINT_GROUP', 'INDEX_COLUMNS', 'Dataset', 'DatasetE
            'reference', 'register', 'resolve', 'safe_id', 'schedule']
 
 ENTRY_POINT_GROUP = 'slp_pose.datasets'
-BUILTIN = ('bobsl', 'auslan_news')   # modules slp_pose.datasets.<name>, each registers its dataset <name>
+BUILTIN = ('bobsl', 'auslan_news', 'how2sign')   # modules slp_pose.datasets.<name>, each registers its dataset <name>
 D = TypeVar('D', bound=Type[Dataset])
 _REGISTRY: Dict[str, Type[Dataset]] = {}
 _FILES: Dict[Path, ModuleType] = {}   # dataset files imported so far, by resolved path

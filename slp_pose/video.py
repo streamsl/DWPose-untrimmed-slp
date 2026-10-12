@@ -126,8 +126,10 @@ class ChunkReader:
 
     Every yielded chunk must be `release()`d once its buffers are no longer needed; the reader
     blocks when all slots are held. Frame-count rule (spec §4.4): the decoded frame count must equal
-    ffprobe nb_frames, otherwise the video ends with an error chunk, unless `allow_frame_mismatch`
-    (then every decodable frame is read and T is whatever was decoded).
+    ffprobe nb_frames, or the dataset's expected_frames when it sets one (VideoInfo.frame_count:
+    a source truncated in its official archive, D28; just as strict), otherwise the video ends with
+    an error chunk, unless `allow_frame_mismatch` (then every decodable frame is read and T is
+    whatever was decoded).
     Use as a context manager, or call `close()`, to stop the thread early.
     """
 
@@ -199,7 +201,10 @@ class ChunkReader:
                             last=True, error=message))
 
     def _decode(self, video: VideoInfo) -> None:
-        if video.nb_frames <= 0 and not self._allow_mismatch:
+        total = video.frame_count   # what the decoded count must equal (without allow_frame_mismatch)
+        expected = f'ffprobe nb_frames={video.nb_frames}' if video.expected_frames is None else \
+            f"the dataset's expected_frames={total} (ffprobe nb_frames={video.nb_frames})"
+        if total <= 0 and not self._allow_mismatch:
             self._fail(video, f'{video.video_id}: ffprobe reports no frames')
             return
         geom = letterbox_geometry(video.width, video.height)
@@ -217,7 +222,7 @@ class ChunkReader:
                     return
                 frames = slot.frames(n_chunk, video.height, video.width)
                 boxes = slot.letterbox.numpy()
-                want = n_chunk if self._allow_mismatch else min(n_chunk, video.nb_frames - start)
+                want = n_chunk if self._allow_mismatch else min(n_chunk, total - start)
                 k, error = 0, None
                 while k < want:
                     view = frames[k]
@@ -234,11 +239,11 @@ class ChunkReader:
                 last = eof
                 if error is None and not self._allow_mismatch:
                     if eof:
-                        error = f'{video.video_id}: decoded {end} frames, ffprobe nb_frames={video.nb_frames}'
-                    elif end == video.nb_frames:
+                        error = f'{video.video_id}: decoded {end} frames, {expected}'
+                    elif end == total:
                         last = True
                         if cap.read()[0]:
-                            error = f'{video.video_id}: more than ffprobe nb_frames={video.nb_frames} frames'
+                            error = f'{video.video_id}: more frames than {expected}'
                 if error is not None:
                     self._free.put(slot)
                     self._fail(video, error)

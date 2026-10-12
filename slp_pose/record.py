@@ -59,6 +59,22 @@ CRCs (D26): a memmap never checks a zip member's CRC-32 and save_persons writes 
   damaged one (nothing is written; only a re-extraction can restore it), and it publishes nothing
   unless the members it copies unchanged were staged with the CRCs that read verified (its memmaps
   read the file a second time); check does the same read unless told not to.
+Read faults (D28): this machine's Storage path returns a wrong byte now and then, mostly
+  transiently. So every check that reads files to verify them retries a failure before it believes
+  it, up to _READ_ATTEMPTS reads in all, the files evicted from the page cache in between (evict): a
+  CRC failure (crc_problems: the whole file is read again), a derive whose second read differs from
+  the first or whose staged poses differ from the record (ReadFault: the whole stage is redone),
+  finalize's comparison of the staged poses with the spill, and check's bitwise poses-vs-persons
+  comparison. Each retried failure is reported (a WARNING by default, `report` callbacks
+  otherwise); a failure on every read fails as before (a ReadFault or CrcFailure is a ValueError).
+  These retries cure a fault above the disk's cache only: on the ntfs-3g (fuseblk) Storage mount
+  evict drops nothing that matters (FUSE re-reads a file on each open anyway), and ntfs-3g reads
+  through /dev/sda1's page cache, which only root can drop, so a wrong byte the disk delivered
+  repeats on every immediate re-read while it stays cached (measured 2026-10-06: most re-reads after
+  evict ran at 0.7-1.5 GB/s, above the SATA link's ~600 MB/s). A later read is the real second
+  chance: the extract parent derives a video refused by a ReadFault or CrcFailure once more at the
+  end of its run, and `check` can be run again, after `sudo sh -c 'sync; echo 1 >
+  /proc/sys/vm/drop_caches'` for a read from the disk itself.
 Memory: a SpillWriter holds one chunk; finalize, derive and check read the big columns through
   memmaps and handle kpts/poses in blocks of _BLOCK_FRAMES frames, so RAM is O(T + N) small
   arrays plus one block, for any video length.
@@ -71,14 +87,16 @@ import errno
 import hashlib
 import io
 import json
+import logging
 import math
 import os
 import shutil
 import struct
 import zipfile
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional, Protocol, Tuple, Union
+from typing import Callable, Dict, Iterator, List, Optional, Protocol, Tuple, Union
 
 import numpy as np
 
@@ -89,6 +107,9 @@ from .rules import Rule, RuleLike, as_frame_rule, as_rule, is_video_rule
 from .select import DEFAULT_POSING_RULES, FrameRule
 from .settings import Settings
 from .types import COUNT_SET, NUM_KEYPOINTS, POSE_SET, POSED, SCHEMA_VERSION, ChunkDets, ChunkPoses, VideoInfo
+
+log = logging.getLogger(__name__)
+Report = Callable[[str], None]   # where a retried read fault is reported (None: a WARNING in `log`)
 
 
 class RuleSource(Protocol):
@@ -109,6 +130,8 @@ _CRC_READ = 16 << 20        # bytes per read when crc_problems verifies a zip
 _DERIVE_KEEPS = ('schema_version', 'video_id', 'frame_size', 'fps', 'num_frames', 'det_offsets', 'det_boxes',
                  'det_scores', 'kpt_offsets', 'kpt_det', 'kpts')
 _REEXTRACT = 're-extract the video: delete its done marker'
+_READ_ATTEMPTS = 3          # reads of a file being verified before its failure is believed (D28)
+_POSES_MISMATCH = 'poses rows are not the primary keypoints'   # the bitwise poses-vs-record problem
 # Spill columns in .work/<vid>/<name>.bin: dtype and per-row shape. *_ends are the CSR offsets
 # without their leading 0; kpt_det is already video-global.
 _SPILL_COLUMNS = {
@@ -167,6 +190,20 @@ class CommitInfo:
     derivation_hash: str
     poses_bytes: int
     persons_bytes: int
+
+
+class ReadFault(ValueError):
+    """A comparison of two reads of the same bytes failed (D28): derive's memmaps against its CRC
+    check, or staged poses against the record they were made from (the bitwise poses problem). On
+    this machine that is a transient read fault as often as damage, so derive and finalize redo
+    the reading after evicting the files from the page cache before they give up with it."""
+
+
+class CrcFailure(ValueError):
+    """derive refused a persons file that failed its CRC check, or had no readable zip directory,
+    on every read of crc_problems (D28). Those reads are not independent on the ntfs-3g Storage
+    mount (module docstring: a wrong byte the disk delivered stays in /dev/sda1's cache), so the
+    extract parent derives the video once more at the end of its run before the failure stands."""
 
 
 # --------------------------------------------------------------------------- persons record
@@ -291,7 +328,7 @@ class PersonsRecord:
                                   .reshape(len(block), -1).any(axis=1))
                for s, block in self._pose_blocks()]
         out: List[str] = []
-        _report(out, 'poses rows are not the primary keypoints (bitwise; zeros without a primary)', np.concatenate(bad))
+        _report(out, f'{_POSES_MISMATCH} (bitwise; zeros without a primary)', np.concatenate(bad))
         return out
 
     def _pose_block(self, start: int, stop: int) -> np.ndarray:
@@ -436,27 +473,99 @@ def _meta_json(row: Dict[str, object]) -> str:
     return json.dumps(row, allow_nan=True)
 
 
-def crc_problems(path: Path) -> List[str]:
+def crc_problems(path: Path, report: Optional[Report] = None) -> List[str]:
     """One line per member of the zip at `path` whose bytes do not match its CRC-32 or cannot be
     read (a bad local header, a member running past the end of the file); [] = intact. Reads the
     whole file once, sequentially, through zipfile, which checks each member's CRC at its end
-    (load_persons with mmap_mode never does). Raises zipfile.BadZipFile when there is no readable
-    central directory."""
-    out = []
-    with zipfile.ZipFile(path) as zf:
+    (load_persons with mmap_mode never does). A read that finds a failure is followed by another of
+    the whole file after it is evicted from the page cache, up to _READ_ATTEMPTS reads in all; the
+    file is intact as soon as one read finds every member intact (D28: a transient read fault
+    passes on a re-read). Each retried read goes to `report`. When every read fails, the lines name
+    the members that failed on every read, else (a member name read differently, e.g. a fault in
+    the zip directory) those of the last read. Raises zipfile.BadZipFile when no read finds a
+    readable central directory."""
+    path = Path(path)
+    reads: List[Dict[str, str]] = []
+    for attempt in range(1, _READ_ATTEMPTS + 1):
+        errors = _crc_errors(path, report)
+        if not errors:
+            return []
+        reads.append(errors)
+        if attempt < _READ_ATTEMPTS:
+            _read_fault(report, f'{path} member {", ".join(errors)}', attempt, '; '.join(errors.values()))
+            evict(path)
+    last = reads[-1]
+    every = [name for name in last if all(name in errors for errors in reads)]
+    return [f'{name}: {last[name]}' for name in every or last]
+
+
+def _crc_errors(path: Path, report: Optional[Report]) -> Dict[str, str]:
+    """{member: why it fails} after one read of every member of the zip at `path` through zipfile.
+    A flipped bit in a local header can also make zipfile see an unknown compression method or an
+    encrypted member, and one in deflated data a zlib error: these fail the member too."""
+    out = {}
+    with _open_zip(path, report) as zf:
         for info in zf.infolist():
             try:
                 with zf.open(info) as member:
                     while member.read(_CRC_READ):
                         pass
-            except (zipfile.BadZipFile, EOFError) as e:
-                out.append(f'{info.filename}: {str(e) or type(e).__name__}')
+            except (zipfile.BadZipFile, EOFError, NotImplementedError, RuntimeError, zlib.error) as e:
+                out[info.filename] = str(e) or type(e).__name__
     return out
 
 
-def _member_crcs(path: Path) -> Dict[str, int]:
+def _open_zip(path: Path, report: Optional[Report]) -> zipfile.ZipFile:
+    """zipfile.ZipFile(path), its central directory read up to _READ_ATTEMPTS times (the file
+    evicted in between); zipfile.BadZipFile when every read fails."""
+    attempt = 1
+    while True:
+        try:
+            return zipfile.ZipFile(path)
+        except zipfile.BadZipFile as e:
+            if attempt == _READ_ATTEMPTS:
+                raise
+            _read_fault(report, f'{path} (its zip directory)', attempt, str(e) or type(e).__name__)
+            evict(path)
+            attempt += 1
+
+
+def evict(*paths: Path, sync: bool = False) -> None:
+    """Drop the cached pages of `paths` from the page cache (posix_fadvise POSIX_FADV_DONTNEED), so
+    the next read does not return a cached copy of a faulty read (D28). On a local file system
+    (ext4 on the SSD) that read then comes from the disk. On the ntfs-3g (fuseblk) Storage mount it
+    does not: this drops only FUSE's pages of the file (none: FUSE re-reads on each open), while
+    ntfs-3g reads through /dev/sda1's page cache, which an unprivileged process cannot drop, so a
+    wrong byte that came from the disk and is still cached comes back (module docstring). DONTNEED
+    drops only clean pages that nobody maps: release memmaps of the file first, and pass `sync` for
+    a file written without fsync (it writes the dirty pages back first). Best effort: a missing
+    file, a system without posix_fadvise or a refusal is skipped (the re-read is verified anyway)."""
+    for path in paths:
+        try:
+            fd = os.open(str(path), os.O_RDONLY)
+        except OSError:
+            continue
+        try:
+            if sync:
+                os.fsync(fd)
+            if hasattr(os, 'posix_fadvise'):
+                os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+        except OSError:
+            pass
+        finally:
+            os.close(fd)
+
+
+def _read_fault(report: Optional[Report], what: str, attempt: int, error: str) -> None:
+    """Report one failed read that is about to be retried (`report`, else a WARNING)."""
+    message = f'read fault? {what}: read {attempt} of {_READ_ATTEMPTS} failed ({error}); evicting it from ' \
+              f'the page cache and reading again'
+    (log.warning if report is None else report)(message)
+
+
+def _member_crcs(path: Path, report: Optional[Report] = None) -> Dict[str, int]:
     """{member name: the CRC-32 the zip's central directory records for it} (reads only that directory)."""
-    with zipfile.ZipFile(path) as zf:
+    with _open_zip(path, report) as zf:
         return {info.filename: info.CRC for info in zf.infolist()}
 
 
@@ -556,11 +665,14 @@ class SpillWriter:
     poses go straight into an NpyStreamWriter at .work/<vid>/poses.npy.
     """
 
-    def __init__(self, root: Path, video: VideoInfo, primary_rule: Union[str, FrameRule]) -> None:
+    def __init__(self, root: Path, video: VideoInfo, primary_rule: Union[str, FrameRule],
+                 report: Optional[Report] = None) -> None:
         """Clear and create .work/<vid>/ (a previous crash may have left files there).
         `primary_rule` is the per-frame rule the chunks were selected with (select.select_chunk): a
-        FrameRule, or a framework rule's name (KeyError for an unknown or video-level rule)."""
+        FrameRule, or a framework rule's name (KeyError for an unknown or video-level rule).
+        `report` receives finalize's retried read faults (None: WARNINGs in this module's log)."""
         self._rule = as_frame_rule(primary_rule)
+        self._report = report
         self.video = video
         self.primary_rule = self._rule.name
         self._layout = OutputLayout(root)
@@ -639,7 +751,29 @@ class SpillWriter:
         self._files[name].write(np.ascontiguousarray(values, _SPILL_COLUMNS[name][0]).data)
 
     def _stage(self, provenance: Dict[str, object]) -> CommitInfo:
-        """Build the record from memmaps of the spill columns, validate it, stage its files."""
+        """Build the record from memmaps of the spill columns, validate it, stage its files. The
+        validation reads back the staged poses and the spill (written just now); when they differ
+        (ReadFault), both are evicted from the page cache and read again, up to _READ_ATTEMPTS
+        times, so a transient read fault costs a re-read instead of a re-extraction (D28)."""
+        attempt = 1
+        while True:
+            record = self._record(provenance)
+            try:
+                _raise_problems(record, np.load(self._dir / _STAGED_POSES, mmap_mode='r'), self._rule)
+                break
+            except ReadFault as e:
+                if attempt == _READ_ATTEMPTS:
+                    raise
+                error = str(e)
+            record = None   # release the memmaps, else eviction keeps their pages
+            _read_fault(self._report, f'{self._dir} (the spill and staged poses, read back to verify the commit)',
+                        attempt, error)
+            evict(*sorted(self._dir.iterdir()), sync=True)
+            attempt += 1
+        return _stage_files(self._dir, record)
+
+    def _record(self, provenance: Dict[str, object]) -> PersonsRecord:
+        """The record over memmaps of the spill columns, with its legacy meta row."""
         columns = {name: _read_column(self._dir / f'{name}.bin', dtype, shape)
                    for name, (dtype, shape) in _SPILL_COLUMNS.items()}
         zero = np.zeros(1, np.int64)
@@ -653,8 +787,7 @@ class SpillWriter:
             primary_rule=self.primary_rule, meta={}, provenance=provenance)
         record.meta = legacy_meta_row(v.video_id, record.frame_size, record.fps, record.num_persons,
                                       record.kpt_offsets, record.kpts, record.kpt_primary)
-        _raise_problems(record, np.load(self._dir / _STAGED_POSES, mmap_mode='r'), self._rule)
-        return _stage_files(self._dir, record)
+        return record
 
 
 def _read_column(path: Path, dtype, row_shape: Tuple[int, ...]) -> np.ndarray:
@@ -668,9 +801,12 @@ def _read_column(path: Path, dtype, row_shape: Tuple[int, ...]) -> np.ndarray:
 
 
 def _raise_problems(record: PersonsRecord, poses: Optional[np.ndarray], rule: Rule) -> None:
+    """ValueError listing the record's problems; ReadFault when the staged poses differ from the
+    record (_POSES_MISMATCH), which a re-read may fix."""
     problems = record.problems(poses, rule)
     if problems:
-        raise ValueError(f'{record.video_id}: invalid record: ' + '; '.join(problems))
+        error = ReadFault if any(p.startswith(_POSES_MISMATCH) for p in problems) else ValueError
+        raise error(f'{record.video_id}: invalid record: ' + '; '.join(problems))
 
 
 def _stage_files(work: Path, record: PersonsRecord, poses: Optional[Path] = None) -> CommitInfo:
@@ -851,7 +987,8 @@ def record_failure(root: Path, video_id: str, error: str, traceback_text: str, a
 
 
 # --------------------------------------------------------------------------- derive
-def derive(root: Path, video_id: str, settings: Settings, primary_rule: RuleLike) -> CommitInfo:
+def derive(root: Path, video_id: str, settings: Settings, primary_rule: RuleLike,
+           report: Optional[Report] = None) -> CommitInfo:
     """CPU re-derivation from persons/<vid>.npz (spec D6, D14, §4.4), no GPU.
 
     `primary_rule` is a rule object (a dataset's own, Dataset.rule) or a framework rule's name.
@@ -869,38 +1006,55 @@ def derive(root: Path, video_id: str, settings: Settings, primary_rule: RuleLike
     its meta row and provenance (and the done marker), never in what render-done draws.
     poses/<vid>.npy is written only when its bytes change (_holds_poses), so such a derive rewrites
     persons/ and the small files but leaves poses/ untouched. A persons file that fails
-    crc_problems, or is no readable zip, raises ValueError before anything is staged (rewriting it
-    would give damaged rows valid CRCs). The rows are then read again through memmaps, so the
-    staged members that derive keeps (_DERIVE_KEEPS) must have the CRCs just verified, else it
-    raises ValueError and publishes nothing (a faulty second read would otherwise be committed).
+    crc_problems, or is no readable zip, raises CrcFailure (a ValueError) before anything is staged
+    (rewriting it would give damaged rows valid CRCs). The rows are then read again through
+    memmaps, so the staged members that derive keeps (_DERIVE_KEEPS) must have the CRCs just
+    verified, else it raises ReadFault (a ValueError) and publishes nothing (a faulty second read
+    would otherwise be committed).
+    Read faults (D28): crc_problems reads a failing file again; when the second read differs or
+    the staged poses differ from the record (ReadFault), the staged files are deleted, the persons
+    and poses files evicted from the page cache and the whole stage redone, up to _READ_ATTEMPTS
+    stages; each retried failure goes to `report` (None: a WARNING in this module's log). A failure
+    on every attempt raises as before (on the Storage mount these re-reads are not independent of
+    the first: module docstring).
     """
     rule = as_rule(primary_rule)
     layout = OutputLayout(root)
     work = layout.work(video_id)
-    _fresh_dir(work)
-    try:
-        info, keep_poses = _stage_derived(layout, work, video_id, settings, rule)
-        _publish(layout, work, video_id, drop_old_marker=False, keep_poses=keep_poses)
-    except BaseException:
-        shutil.rmtree(work, ignore_errors=True)
-        raise
-    return info
+    attempt = 1
+    while True:
+        _fresh_dir(work)
+        try:
+            info, keep_poses = _stage_derived(layout, work, video_id, settings, rule, report)
+            _publish(layout, work, video_id, drop_old_marker=False, keep_poses=keep_poses)
+            return info
+        except ReadFault as e:
+            shutil.rmtree(work, ignore_errors=True)
+            if attempt == _READ_ATTEMPTS:
+                raise
+            error = str(e)   # the traceback (and the old record's memmaps) dies with `e` here
+        except BaseException:
+            shutil.rmtree(work, ignore_errors=True)
+            raise
+        _read_fault(report, f'derive {video_id}', attempt, error)
+        evict(layout.persons(video_id), layout.poses(video_id))
+        attempt += 1
 
 
 def _stage_derived(layout: OutputLayout, work: Path, video_id: str, settings: Settings,
-                   primary_rule: Rule) -> Tuple[CommitInfo, bool]:
+                   primary_rule: Rule, report: Optional[Report] = None) -> Tuple[CommitInfo, bool]:
     """Stage the re-derived files in `work` and say whether the committed poses/<vid>.npy is kept
     (it already holds the derived bytes, so none are staged); the memmaps of the old record die
     with this call."""
     from .detpost import count_set_mask   # detpost imports torch; keep `record` importable without it
     persons = layout.persons(video_id)
     try:
-        bad = crc_problems(persons)
+        bad = crc_problems(persons, report)
     except zipfile.BadZipFile as e:
-        raise ValueError(f'{persons} is not a readable zip ({e}), so it is not derived ({_REEXTRACT})') from e
+        raise CrcFailure(f'{persons} is not a readable zip ({e}), so it is not derived ({_REEXTRACT})') from e
     if bad:
-        raise ValueError(f'{persons} fails its CRC check, so it is not derived ({_REEXTRACT}): ' + '; '.join(bad))
-    verified = _member_crcs(persons)
+        raise CrcFailure(f'{persons} fails its CRC check, so it is not derived ({_REEXTRACT}): ' + '; '.join(bad))
+    verified = _member_crcs(persons, report)
     old = load_persons(persons, mmap_mode='r')
     damaged = old._structure_problems() + ([] if old.video_id == video_id else [f'holds video {old.video_id!r}'])
     if damaged:
@@ -947,8 +1101,8 @@ def _stage_derived(layout: OutputLayout, work: Path, video_id: str, settings: Se
     staged = _member_crcs(work / _STAGED_PERSONS)
     reread = [name for name in _DERIVE_KEEPS if staged.get(f'{name}.npy') != verified.get(f'{name}.npy')]
     if reread:
-        raise ValueError(f'{persons}: derive read other bytes of {", ".join(reread)} than its CRC check did (a '
-                         f'faulty read, or the file changed meanwhile), so it is not derived; run derive again')
+        raise ReadFault(f'{persons}: derive read other bytes of {", ".join(reread)} than its CRC check did (a '
+                        f'faulty read, or the file changed meanwhile), so it is not derived; run derive again')
     return info, keep_poses
 
 
@@ -986,7 +1140,8 @@ class CheckReport:
 
 
 def check(root: Path, video_id: str, switch_iou: float = 0.3, window_s: float = 2.0,
-          dataset: Optional[RuleSource] = None, verify_crc: bool = True) -> CheckReport:
+          dataset: Optional[RuleSource] = None, verify_crc: bool = True,
+          report: Optional[Report] = None) -> CheckReport:
     """Verify the §4.1 invariants for a committed video and flag primary switches.
 
     `dataset` (a Dataset or its class) resolves the record's primary_rule (Dataset.rule, D22: a
@@ -998,6 +1153,12 @@ def check(root: Path, video_id: str, switch_iou: float = 0.3, window_s: float = 
     t where both t-1 and t have a primary and IoU(primary box t-1, primary box t) < switch_iou.
     Suggested windows are [t - window_s*fps, t + window_s*fps) (rounded up to whole frames)
     clipped to [0, T) and merged when they overlap or touch.
+    Read faults (D28): a CRC failure (crc_problems) or poses that differ from the persons record
+    bit for bit are read again after both files are evicted from the page cache, up to
+    _READ_ATTEMPTS reads in all, and reported only when every read finds them (a re-read that
+    cannot load the files counts as a failed read; the CRC lines are kept); each retried failure
+    goes to `report` (None: a WARNING in this module's log). On the Storage mount these re-reads
+    are not independent of the first (module docstring): run check again later to re-read.
     """
     layout = OutputLayout(root)
     paths = (layout.persons(video_id), layout.poses(video_id), layout.meta_json(video_id), layout.done_marker(video_id))
@@ -1005,7 +1166,7 @@ def check(root: Path, video_id: str, switch_iou: float = 0.3, window_s: float = 
     if missing:
         return CheckReport(video_id, missing, [], [])
     try:
-        damaged = crc_problems(layout.persons(video_id)) if verify_crc else []
+        damaged = crc_problems(layout.persons(video_id), report) if verify_crc else []
         record = load_persons(layout.persons(video_id), mmap_mode='r')
         poses = np.load(layout.poses(video_id), mmap_mode='r')
         problems = [f'the persons file fails its CRC check: {line}' for line in damaged]
@@ -1015,10 +1176,29 @@ def check(root: Path, video_id: str, switch_iou: float = 0.3, window_s: float = 
     structural = record._structure_problems()
     if structural:
         return CheckReport(video_id, problems + structural, [], [])
+    found = record.problems(poses, dataset=dataset)
+    error = next((line for line in found if line.startswith(_POSES_MISMATCH)), None)
+    attempt = 1
+    while error is not None and attempt < _READ_ATTEMPTS:
+        record = poses = None   # release the memmaps, else eviction keeps their pages
+        _read_fault(report, f'{layout.poses(video_id)} vs {layout.persons(video_id)}', attempt, error)
+        evict(layout.persons(video_id), layout.poses(video_id))
+        attempt += 1
+        try:
+            record = load_persons(layout.persons(video_id), mmap_mode='r')
+            poses = np.load(layout.poses(video_id), mmap_mode='r')
+        except (OSError, ValueError, zipfile.BadZipFile) as e:   # one more failed read
+            record = poses = None
+            found = [f'unreadable output: {e}']
+            error = found[0]
+            continue
+        found = record.problems(poses, dataset=dataset)
+        error = next((line for line in found if line.startswith(_POSES_MISMATCH)), None)
+    if record is None or record._structure_problems():   # the last re-read failed or differs this much
+        return CheckReport(video_id, problems + found, [], [])
     switches = _primary_switches(record, switch_iou)
     half = math.ceil(window_s * record.fps[0] / record.fps[1])
-    return CheckReport(video_id, problems + record.problems(poses, dataset=dataset), switches,
-                       _merge_windows(switches, half, record.num_frames))
+    return CheckReport(video_id, problems + found, switches, _merge_windows(switches, half, record.num_frames))
 
 
 def derivation_problems(root: Path, video_id: str, settings: Settings, primary_rule: RuleLike) -> List[str]:
