@@ -7,8 +7,9 @@ A video-level rule (VideoRule) sees the posed people of a whole video (PosedPeop
 frame, one POSED person or none (-1), plus the interpreter's region (SignerChoice). It runs in
 `record.derive` on the CPU after extraction; extraction itself poses with a per-frame rule
 (select.py) chosen so that the signer is among the posed people. The framework's own rule is
-`signer_track` (VIDEO_RULES; BOBSL's primary rule); a rule for one dataset only is defined in that
-dataset's file from the building blocks below and listed in its Dataset.rules (D22): Auslan News'
+`signer_track` (VIDEO_RULES); a rule for one dataset only is defined in that dataset's file from
+the building blocks below and listed in its Dataset.rules (D22): BOBSL's `signer_track_bobsl`
+(slp_pose/datasets/bobsl.py) is `signer_track` with step 5's gate (D29); Auslan News'
 `signer_track_right` (slp_pose/datasets/auslan_news.py) adds a right-hand position prior, a
 signing-motion test in step 5 and a step 6 that fills the panel's gaps with an on-site interpreter.
 
@@ -47,12 +48,17 @@ signing-motion test in step 5 and a step 6 that fills the panel's gaps with an o
 5. Outside the main spot's segments (or in a video without a main spot), the signer is the other
    segment present in most frames of [t - window_s, t + window_s], among the segments whose span
    contains t, that are present in at least min_track_s in all (people in programme footage
-   change with the cuts), that are steady: present in at least min_density of their span inside
-   that window (a centred full-screen interpreter is; people coming and going in footage are
-   not), and, when the caller gives a per-box activity test (`active`, `min_active` > 0: a dataset
-   rule's signing motion), that are active in at least min_active of their boxes inside that
-   window. Ties go to the prior, then to the longer presence, then to the earlier segment. -1 when
-   there is no such segment, or it has no box at t.
+   change with the cuts), that fit the main spot's interpreter when the rule asks so (D29:
+   other_iou or other_scale > 0; the defaults ask nothing, and a video without a main spot has
+   nobody to fit): their median box overlaps the median box of one of the main spot's anchors
+   (step 2) by IoU >= other_iou, and their median box size and the median shoulder width of their
+   measured boxes are within a factor other_scale of that anchor's (as a track fits a spot in step
+   2; an unmeasured width passes), that are steady: present in at least min_density of their span
+   inside that window (a centred full-screen interpreter is; people coming and going in footage
+   are not), and, when the caller gives a per-box activity test (`active`, `min_active` > 0: a
+   dataset rule's signing motion), that are active in at least min_active of their boxes inside
+   that window. Ties go to the prior, then to the longer presence, then to the earlier segment. -1
+   when there is no such segment, or it has no box at t.
 Steps 1-3 are spot_layout (a SpotLayout), steps 4-5 signer_segments, and SpotLayout.choice turns
 the chosen segment per frame into the SignerChoice; a dataset rule may change the chosen segments
 in between (Auslan News' step 6).
@@ -102,14 +108,16 @@ _MIN_SHOULDER_WIDTH = 1e-6   # px; a narrower shoulder pair is no shoulder pair
 _BLOCK_ROWS = 16384          # posed rows read from kpts at a time
 _MEDIAN_CELLS = 1 << 20      # window cells sorted at a time by _window_median
 PriorKey = Callable[[np.ndarray], float]   # a spot's boxes (n,4) float64 -> its prior key (larger wins)
+OTHER_FIELDS = ('other_iou', 'other_scale')   # D29's step-5 gate, hashed only when set (SignerTrackParams.fingerprint)
 
 
 @dataclass(frozen=True)
 class SignerTrackParams:
     """Parameters of `signer_track` (module docstring, steps 1-5); seconds are converted with the
     video's exact frame rate. The first five fields keep their order (positional construction).
-    The defaults are D24's (BOBSL); D14's box-only spots are fit_iou=0, fit_scale=0, max_scale=0,
-    min_scale=0.
+    The defaults are D24's (the framework's `signer_track`); D14's box-only spots are fit_iou=0,
+    fit_scale=0, max_scale=0, min_scale=0. Step 5's gate (D29: other_iou, other_scale) is off by
+    default; BOBSL's own rule sets it (datasets/bobsl.py).
 
     prior names the position prior that the caller passes as a prior_key function (None: no
     preference); only the name is hashed (VideoRule.params), so a changed key function needs a new
@@ -132,6 +140,8 @@ class SignerTrackParams:
     scale_window_s: float = 1.0    # ... the median width of its track's boxes within +- half this
     min_scale: float = 0.25    # ... and at least this many (0: none; a close-up's barely seen shoulders: junk widths)
     point_conf: float = 0.3    # a shoulder is seen when its score > this
+    other_iou: float = 0.0     # step 5 (D29): a segment's median box overlaps a main anchor's by IoU >= this (0: none)
+    other_scale: float = 0.0   # ... with box size and shoulder width within this factor of that anchor's (0: none)
 
     def __post_init__(self) -> None:
         if self.prior is not None and (not isinstance(self.prior, str) or not self.prior):
@@ -140,16 +150,22 @@ class SignerTrackParams:
                      and 0.0 < self.max_visit_share <= 1.0 and 0.0 <= self.fit_iou <= 1.0
                      and 0.0 <= self.point_conf < 1.0)
         scales_ok = ((self.fit_scale == 0 or self.fit_scale >= 1) and (self.max_scale == 0 or self.max_scale >= 1)
-                     and 0.0 <= self.min_scale < 1.0)
-        if (not 0.0 < self.link_iou <= 1.0 or not shares_ok or not scales_ok
+                     and 0.0 <= self.min_scale < 1.0 and (self.other_scale == 0 or self.other_scale >= 1))
+        if (not 0.0 < self.link_iou <= 1.0 or not shares_ok or not scales_ok or not 0.0 <= self.other_iou <= 1.0
                 or min(self.max_gap_s, self.min_track_s, self.window_s, self.merge_gap_s, self.min_visit_s,
                        self.anchor_s, self.scale_window_s) < 0):
             raise ValueError(f'bad signer_track parameters {self}')
 
     @property
     def uses_scale(self) -> bool:
-        """Whether the rule compares shoulder widths (fit_scale, max_scale, min_scale), so needs the keypoints."""
-        return self.fit_scale > 0 or self.max_scale > 0 or self.min_scale > 0
+        """Whether the rule compares shoulder widths (fit_scale, max_scale, min_scale, other_scale), so needs
+        the keypoints."""
+        return self.fit_scale > 0 or self.max_scale > 0 or self.min_scale > 0 or self.other_scale > 0
+
+    def fingerprint(self) -> Dict[str, object]:
+        """The parameters hashed into the derivation hash (VideoRule.params): dataclasses.asdict, without
+        D29's step-5 fields (OTHER_FIELDS) where they are 0, so a rule without that gate keeps its hash."""
+        return {k: v for k, v in dataclasses.asdict(self).items() if k not in OTHER_FIELDS or v}
 
 
 @dataclass(frozen=True)
@@ -254,10 +270,13 @@ class SpotLayout:
     boxes: (M,4) float64 posed boxes; frame: (M,) int64 frame of each row;
     tracks: (M,) int64 link_tracks id of each row;
     track_spot: (M,) int64 spot of each row's track (-1 for a short track), whether or not the row
-        itself overlaps that spot;
+        itself overlaps that spot; anchors: per spot id, the median boxes (n,4) float64 and median
+        shoulder widths (n,) float64 (NaN: none measured) of its anchors (step 2: its founder and
+        every fitting track at least anchor_s long);
     segment: (M,) int64 segment of each row (-1: none; spot_segments); spot: (S,) int64 spot of each
         segment; spot_box: (spots,4) float64 box of each spot (the median box of its founding track);
-    rows: per segment, its rows in frame order; frames: per segment, the frames of those rows.
+    rows: per segment, its rows in frame order; frames: per segment, the frames of those rows;
+    width: (M,) float64 shoulder width of each row (NaN: no pair), None without widths.
     """
 
     offsets: np.ndarray
@@ -271,6 +290,8 @@ class SpotLayout:
     spot_box: np.ndarray
     rows: Tuple[np.ndarray, ...]
     frames: Tuple[np.ndarray, ...]
+    anchors: Tuple[Tuple[np.ndarray, np.ndarray], ...]
+    width: Optional[np.ndarray]
 
     @property
     def num_frames(self) -> int:
@@ -312,11 +333,13 @@ def spot_layout(boxes: np.ndarray, offsets: np.ndarray, fps: Tuple[int, int],
         raise ValueError(f'width has shape {np.shape(width)}; expected ({len(boxes)},)')
     if not len(boxes):
         none = np.zeros(0, np.int64)
-        return SpotLayout(offsets, rate, np.zeros((0, 4)), frame, none, none, none, none, np.zeros((0, 4)), (), ())
+        return SpotLayout(offsets, rate, np.zeros((0, 4)), frame, none, none, none, none, np.zeros((0, 4)), (), (),
+                          (), None if width is None else np.zeros(0))
     boxes = np.asarray(boxes, np.float64)
+    width = None if width is None else np.asarray(width, np.float64)
     tracks = link_tracks(boxes, offsets, params.link_iou, round(params.max_gap_s * rate))
     min_visit = min(round(params.min_visit_s * rate), max(1, math.floor(params.max_visit_share * num_frames)))
-    segment, spot, spot_box, track_spot = _spot_segments(
+    segment, spot, spot_box, track_spot, anchors = _spot_segments(
         boxes, frame, tracks, params.link_iou, round(params.merge_gap_s * rate), min_visit, width=width,
         anchor=round(params.anchor_s * rate), fit_iou=params.fit_iou, fit_scale=params.fit_scale,
         max_scale=params.max_scale, min_scale=params.min_scale, half=round(params.scale_window_s * rate / 2))
@@ -325,7 +348,7 @@ def spot_layout(boxes: np.ndarray, offsets: np.ndarray, fps: Tuple[int, int],
     cuts = np.searchsorted(segment[rows], np.arange(len(spot) + 1))
     by_segment = tuple(rows[cuts[j]:cuts[j + 1]] for j in range(len(spot)))
     return SpotLayout(offsets, rate, boxes, frame, tracks, track_spot, segment, spot, spot_box, by_segment,
-                      tuple(frame[r] for r in by_segment))
+                      tuple(frame[r] for r in by_segment), anchors, width)
 
 
 def spot_keys(layout: SpotLayout, prior_key: Optional[PriorKey] = None) -> np.ndarray:
@@ -355,7 +378,8 @@ def signer_segments(layout: SpotLayout, params: SignerTrackParams, keys: np.ndar
     rate = layout.rate
     active = np.ones(len(layout.boxes), bool) if active is None else np.asarray(active, bool)
     main = _main_spot(spot, layout.presence, keys, params.main_share * num_frames)
-    others = [j for j in range(len(spot)) if spot[j] != main and len(frames[j]) >= round(params.min_track_s * rate)]
+    others = [j for j in range(len(spot)) if spot[j] != main and len(frames[j]) >= round(params.min_track_s * rate)
+              and _fits_main(layout, j, main, params)]
     if others:
         best = _signer_per_frame([frames[j] for j in others], [active[layout.rows[j]] for j in others],
                                  keys[spot[others]], round(params.window_s * rate), params.min_density, min_active,
@@ -393,12 +417,12 @@ def signer_track(boxes: np.ndarray, offsets: np.ndarray, fps: Tuple[int, int],
 def track_rule(name: str, params: SignerTrackParams = SignerTrackParams(),
                prior_key: Optional[PriorKey] = None) -> VideoRule:
     """`signer_track` with `params` (and the prior_key that params.prior names) as a VideoRule named
-    `name`; its hashed params are dataclasses.asdict(params). Of the keypoints it reads only the
-    shoulders (shoulder_widths), and only when params.uses_scale."""
+    `name`; its hashed params are params.fingerprint(). Of the keypoints it reads only the shoulders
+    (shoulder_widths), and only when params.uses_scale."""
     if (params.prior is None) != (prior_key is None):
         raise ValueError(f'params.prior {params.prior!r} names the prior_key function: give both or neither')
     return VideoRule(name, functools.partial(_track_people, params=params, prior_key=prior_key),
-                     dataclasses.asdict(params))
+                     params.fingerprint())
 
 
 def _track_people(people: PosedPeople, params: SignerTrackParams, prior_key: Optional[PriorKey]) -> SignerChoice:
@@ -406,8 +430,9 @@ def _track_people(people: PosedPeople, params: SignerTrackParams, prior_key: Opt
     return signer_track_choice(people.boxes, people.offsets, people.fps, params, prior_key, width)
 
 
-# The framework's video-level rule: the spot rule without a position prior (BOBSL's primary rule),
-# D14's with D24's spot identity (anchors, scale tests: SignerTrackParams' defaults).
+# The framework's video-level rule: the spot rule without a position prior (BOBSL's until D29, whose
+# own rule adds step 5's gate), D14's with D24's spot identity (anchors, scale tests: SignerTrackParams'
+# defaults).
 VIDEO_RULES: Dict[str, VideoRule] = {'signer_track': track_rule('signer_track')}
 
 
@@ -615,19 +640,21 @@ def spot_segments(boxes: np.ndarray, frame: np.ndarray, tracks: np.ndarray, link
             are numbered in order of their first frame.
         spot: (S,) int64 spot of each segment; spots are numbered in founding order.
     """
-    segment, spot, _, _ = _spot_segments(boxes, frame, tracks, link_iou, merge_gap, min_visit, width=width,
-                                         anchor=anchor, fit_iou=fit_iou, fit_scale=fit_scale, max_scale=max_scale,
-                                         min_scale=min_scale, half=half)
+    segment, spot, _, _, _ = _spot_segments(boxes, frame, tracks, link_iou, merge_gap, min_visit, width=width,
+                                            anchor=anchor, fit_iou=fit_iou, fit_scale=fit_scale,
+                                            max_scale=max_scale, min_scale=min_scale, half=half)
     return segment, spot
 
 
 def _spot_segments(boxes: np.ndarray, frame: np.ndarray, tracks: np.ndarray, link_iou: float, merge_gap: int,
                    min_visit: int, *, width: Optional[np.ndarray] = None, anchor: int = 0, fit_iou: float = 0.0,
                    fit_scale: float = 0.0, max_scale: float = 0.0, min_scale: float = 0.0,
-                   half: int = 0) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+                   half: int = 0) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray,
+                                           Tuple[Tuple[np.ndarray, np.ndarray], ...]]:
     """spot_segments, plus the (spots, 4) float64 box of every spot (the median box of the track
-    that founded it), indexed by spot id, and the (M,) int64 spot of every row's track (-1 for a
-    short track), whether or not the row itself overlaps that spot."""
+    that founded it), indexed by spot id, the (M,) int64 spot of every row's track (-1 for a
+    short track), whether or not the row itself overlaps that spot, and per spot id the median
+    boxes (n, 4) and median shoulder widths (n,) (NaN: none measured, or no widths) of its anchors."""
     order = np.argsort(tracks, kind='stable')
     cuts = np.searchsorted(tracks[order], np.arange(tracks.max() + 2))
     median = np.array([np.median(boxes[order[cuts[j]:cuts[j + 1]]], axis=0) for j in range(len(cuts) - 1)])
@@ -657,6 +684,10 @@ def _spot_segments(boxes: np.ndarray, frame: np.ndarray, tracks: np.ndarray, lin
         spot_box[spots], spot_scale[spots] = median[j], scale[j]   # a spot of its own
         spot_of_track[j], anchor_track[j] = spots, True
         spots += 1
+    held = np.flatnonzero(anchor_track)    # the anchor tracks, grouped by spot
+    held = held[np.argsort(spot_of_track[held], kind='stable')]
+    bounds = np.searchsorted(spot_of_track[held], np.arange(spots + 1))
+    spot_anchors = tuple((median[held[a:b]], scale[held[a:b]]) for a, b in zip(bounds[:-1], bounds[1:]))
     spot = spot_of_track[tracks]
     fit = _ious(spot_box[spot], boxes)
     inside = fit >= link_iou
@@ -669,7 +700,7 @@ def _spot_segments(boxes: np.ndarray, frame: np.ndarray, tracks: np.ndarray, lin
                           max_scale if max_scale > 0 else np.inf)
     rows = np.flatnonzero(inside & (spot >= 0))
     if not len(rows):
-        return np.full(len(boxes), -1, np.int64), np.zeros(0, np.int64), spot_box[:spots], spot
+        return np.full(len(boxes), -1, np.int64), np.zeros(0, np.int64), spot_box[:spots], spot, spot_anchors
     rows = rows[np.lexsort((-fit[rows], frame[rows], spot[rows]))]   # by spot, frame, best fit first
     rows = rows[np.r_[True, (spot[rows][1:] != spot[rows][:-1]) | (frame[rows][1:] != frame[rows][:-1])]]
     starts = np.r_[True, (spot[rows][1:] != spot[rows][:-1]) | (np.diff(frame[rows]) - 1 > merge_gap)]
@@ -679,7 +710,7 @@ def _spot_segments(boxes: np.ndarray, frame: np.ndarray, tracks: np.ndarray, lin
     segment[rows] = rank[np.cumsum(starts) - 1]
     segment_spot = np.empty(len(rank), np.int64)
     segment_spot[rank] = spot[rows][starts]
-    return segment, segment_spot, spot_box[:spots], spot
+    return segment, segment_spot, spot_box[:spots], spot, spot_anchors
 
 
 def _fits(box: np.ndarray, scale: float, spot_box: np.ndarray, spot_scale: float, fit_scale: float) -> bool:
@@ -691,6 +722,24 @@ def _fits(box: np.ndarray, scale: float, spot_box: np.ndarray, spot_scale: float
         return False
     ratios = (math.sqrt(_area(box) / _area(spot_box)), scale / spot_scale)
     return all(1 / fit_scale <= r <= fit_scale for r in ratios if not math.isnan(r))
+
+
+def _fits_main(layout: SpotLayout, j: int, main: int, params: SignerTrackParams) -> bool:
+    """Step 5's gate (D29): whether segment j fits the main spot's interpreter. True without the gate
+    (other_iou and other_scale 0) or without a main spot; else when its median box overlaps the median
+    box of one of the main spot's anchors by IoU >= other_iou and its median box size and the median
+    shoulder width of its measured boxes are within a factor other_scale of that anchor's (_fits; an
+    unmeasured width passes)."""
+    if not (params.other_iou > 0 or params.other_scale > 0) or main < 0:
+        return True
+    rows = layout.rows[j]
+    box, scale = np.median(layout.boxes[rows], axis=0), math.nan
+    if layout.width is not None and np.isfinite(layout.width[rows]).any():
+        scale = float(np.nanmedian(layout.width[rows]))
+    anchor_boxes, anchor_scales = layout.anchors[main]
+    near = _ious(np.broadcast_to(box, anchor_boxes.shape), anchor_boxes) >= params.other_iou
+    return any(_fits(box, scale, anchor_box, anchor_scale, params.other_scale)
+               for anchor_box, anchor_scale in zip(anchor_boxes[near], anchor_scales[near]))
 
 
 def _narrow(rows: np.ndarray, frame: np.ndarray, tracks: np.ndarray, width: np.ndarray, half: int,
