@@ -1,5 +1,5 @@
-"""Auslan-Daily TV news (News_V1 + News_V2): readable video ids, V1 splits and annotation names,
-and this dataset's own signer rules.
+"""Auslan-Daily TV news (News_V1 + News_V2) as one dataset: readable video ids, one split, the
+annotation names, sign-aligned subtitles (D30) and this dataset's own signer rules.
 
 Under <data root>/Auslan-Daily/ the videos are 'ABC News With Auslan - D M YYYY.mp4' in News_V1/
 (2022-2023, sentence annotations in News_V1_Annotation.xlsx, whose Video_Name is 'D_M_YYYY';
@@ -52,6 +52,7 @@ import dataclasses
 import re
 import zipfile
 from dataclasses import dataclass
+from fractions import Fraction
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from xml.etree import ElementTree
@@ -62,9 +63,11 @@ from .. import signer
 from ..select import FrameRule
 from ..signer import MotionParams, PosedPeople, SignerChoice, SignerTrackParams, SpotLayout, VideoRule, Wrists
 from . import register
+from ..subs import Cue, read_vtt
 from .base import Dataset, Video
 
 V1_ANNOTATION = 'News_V1_Annotation.xlsx'   # inside Auslan-Daily/
+V2_SUBTITLES = 'News_V2_Aligned_VTTS'        # inside Auslan-Daily/: <News_V2 file stem>.vtt, sign-aligned
 _NAME = re.compile(r'ABC News With Auslan - (\d{1,2}) (\d{1,2}) (\d{4})')
 _XLSX = '{http://schemas.openxmlformats.org/spreadsheetml/2006/main}'
 
@@ -219,9 +222,33 @@ DAMAGED: Dict[str, str] = {
 }
 
 
+# One split of the 125 videos, News_V1 and News_V2 as one dataset (user, 2026-10-13): the split of the
+# StreamSLST Auslan-Daily baselines (data_real/auslan_daily_split.json; whole videos, stratified by subset
+# and year), so misaligned-slt is compared with them on the same videos. Every other video is train (101).
+SPLIT_DEV = ('abc_news_2022-10-23', 'abc_news_2022-11-13', 'abc_news_2023-02-05', 'abc_news_2023-06-11',
+             'abc_news_2023-10-01', 'abc_news_2024-03-31', 'abc_news_2024-04-14', 'abc_news_2024-07-07')
+SPLIT_TEST = ('abc_news_2022-07-03', 'abc_news_2022-09-18', 'abc_news_2022-10-09', 'abc_news_2022-10-30',
+              'abc_news_2023-03-12', 'abc_news_2023-04-16', 'abc_news_2023-06-18', 'abc_news_2023-08-20',
+              'abc_news_2023-12-10', 'abc_news_2024-03-03', 'abc_news_2024-03-24', 'abc_news_2024-09-01',
+              'abc_news_2024-10-20', 'abc_news_2024-10-27', 'abc_news_2024-11-03', 'abc_news_2025-02-02')
+
+
+def split_of(vid: str) -> str:
+    """The video's split: dev, test (the two lists above) or train."""
+    return 'dev' if vid in SPLIT_DEV else 'test' if vid in SPLIT_TEST else 'train'
+
+
 @register
 class AuslanNews(Dataset):
-    """News_V1 + News_V2; split = the V1 workbook's split (None for V2); info: subset, annotation_name."""
+    """News_V1 + News_V2 as one dataset; split = split_of; info: subset, annotation_name.
+
+    Subtitles (`captions`, D30): one track 'en', sign-aligned, normalized the same way for both
+    subsets: News_V1 = the workbook rows of the video (Video_Name = annotation_name; Subtitle,
+    Begin_Frame / End_Frame at the video's exact frame rate), News_V2 = the cues of
+    News_V2_Aligned_VTTS/<annotation_name>.vtt. The V1 annotations are lowercase, so every text is
+    lowercased (punctuation kept). News_V2_Aligned_VTTS_Normalized_Text is not used: it reduces words
+    to their dictionary form ('calls' -> 'call', 'as' -> 'a'), which changes the English sentences.
+    """
 
     name = 'auslan_news'
     primary_rule = 'signer_track_right'
@@ -237,14 +264,27 @@ class AuslanNews(Dataset):
         return self.source / 'dwpose'
 
     def videos(self) -> List[Video]:
-        splits = v1_splits(self.source / V1_ANNOTATION)
         out = []
         for path in sorted(self.source.glob('News_V[12]/*.mp4')):
             subset, name = path.parent.name, annotation_name(path)
             vid = video_id(path)
-            out.append(Video(vid, path, splits.get(name) if subset == 'News_V1' else None,
-                             dict(subset=subset, annotation_name=name), known_damage=DAMAGED.get(vid)))
+            out.append(Video(vid, path, split_of(vid), dict(subset=subset, annotation_name=name),
+                             known_damage=DAMAGED.get(vid)))
         return out
+
+    def captions(self, video: Video, fps: Fraction) -> Dict[str, List[Cue]]:
+        if video.info['subset'] == 'News_V1':
+            cues = [Cue(Fraction(begin) / fps, Fraction(end) / fps, text)
+                    for begin, end, text in self._v1_rows().get(video.info['annotation_name'], [])]
+        else:
+            cues = read_vtt(self.source / V2_SUBTITLES / f"{video.info['annotation_name']}.vtt")
+        return {'en': [Cue(c.start, c.end, c.text.lower()) for c in cues]}
+
+    def _v1_rows(self) -> Dict[str, List[Tuple[int, int, str]]]:
+        """{Video_Name: [(Begin_Frame, End_Frame, Subtitle)]} of the workbook (read once)."""
+        if getattr(self, '_v1', None) is None:
+            self._v1 = v1_subtitles(self.source / V1_ANNOTATION)
+        return self._v1
 
 
 def _date(path: Path) -> Tuple[int, int, int]:
@@ -270,23 +310,30 @@ def annotation_name(path: Path) -> str:
     return Path(path).stem
 
 
-def v1_splits(xlsx: Path) -> Dict[str, str]:
-    """{Video_Name: split} of the TV-news rows of the News_V1 annotation workbook (first sheet;
-    'EA<n>' Web News rows are skipped). Raises ValueError when a video has rows in more than one
-    split."""
+def read_workbook(xlsx: Path) -> List[Dict[str, str]]:
+    """The rows of the workbook's first sheet as {header name: cell text} (zipfile + ElementTree)."""
     with zipfile.ZipFile(xlsx) as zf:
         shared = [''.join(t.text or '' for t in si.iter(f'{_XLSX}t'))
                   for si in ElementTree.fromstring(zf.read('xl/sharedStrings.xml')).iter(f'{_XLSX}si')]
         sheet = ElementTree.fromstring(zf.read('xl/worksheets/sheet1.xml'))
     rows = [_cells(row, shared) for row in sheet.iter(f'{_XLSX}row')]
     columns = {name: col for col, name in rows[0].items()}
-    out: Dict[str, str] = {}
-    for row in rows[1:]:
-        name, split = row.get(columns['Video_Name'], ''), row.get(columns['split'], '')
+    return [{name: row.get(col, '') for name, col in columns.items()} for row in rows[1:]]
+
+
+def v1_subtitles(xlsx: Path) -> Dict[str, List[Tuple[int, int, str]]]:
+    """{Video_Name: [(Begin_Frame, End_Frame, Subtitle)]} of the TV-news rows of the News_V1 workbook,
+    in row order ('EA<n>' Web News rows and empty rows are skipped). ValueError for a frame that is not
+    a whole number."""
+    out: Dict[str, List[Tuple[int, int, str]]] = {}
+    for i, row in enumerate(read_workbook(xlsx), start=2):
+        name = row.get('Video_Name', '').strip()
         if not name or name.startswith('EA'):
             continue
-        if out.setdefault(name, split) != split:
-            raise ValueError(f'{xlsx}: video {name!r} has rows in splits {out[name]!r} and {split!r}')
+        frames = [float(row.get(key) or 'nan') for key in ('Begin_Frame', 'End_Frame')]
+        if not all(f.is_integer() and f >= 0 for f in frames):
+            raise ValueError(f'{xlsx}: row {i}: Begin_Frame / End_Frame {frames} are not frame numbers')
+        out.setdefault(name, []).append((int(frames[0]), int(frames[1]), row.get('Subtitle', '')))
     return out
 
 

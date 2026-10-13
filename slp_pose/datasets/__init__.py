@@ -27,12 +27,13 @@ from typing import Dict, List, Optional, Type, TypeVar, Union
 from ..rules import Rule, framework_names
 from ..select import FrameRule
 from ..signer import PosedPeople, SignerChoice, VideoRule
+from ..subs import Cue, read_vtt
 from .base import (INDEX_COLUMNS, Dataset, DatasetError, Video, check_dataset_class, index_table, load_videos,
                    safe_id, schedule)
 
-__all__ = ['BUILTIN', 'ENTRY_POINT_GROUP', 'INDEX_COLUMNS', 'Dataset', 'DatasetError', 'FrameRule', 'PosedPeople',
-           'SignerChoice', 'Video', 'VideoRule', 'builtin_rule', 'dataset_class', 'index_table', 'load_videos', 'names',
-           'reference', 'register', 'resolve', 'safe_id', 'schedule']
+__all__ = ['BUILTIN', 'Cue', 'ENTRY_POINT_GROUP', 'INDEX_COLUMNS', 'Dataset', 'DatasetError', 'FrameRule',
+           'PosedPeople', 'SignerChoice', 'Video', 'VideoRule', 'builtin_rule', 'dataset_class', 'index_table',
+           'load_videos', 'names', 'read_vtt', 'reference', 'register', 'resolve', 'safe_id', 'schedule']
 
 ENTRY_POINT_GROUP = 'slp_pose.datasets'
 BUILTIN = ('bobsl', 'auslan_news', 'how2sign')   # modules slp_pose.datasets.<name>, each registers its dataset <name>

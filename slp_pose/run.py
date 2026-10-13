@@ -239,12 +239,15 @@ def write_video_index(path: Path, header: Sequence[str], rows: Sequence[Dict[str
 
 def merge_meta(out_root: Path) -> Path:
     """Write <out_root>/video_meta.csv from .state/meta/*.json (meta.load_meta_rows +
-    meta.write_video_meta); returns the CSV path. Only rows of videos with a done marker."""
-    from . import meta
+    meta.write_video_meta); returns the CSV path. Only rows of videos with a done marker; their
+    caption_source comes from .state/captions.json when `slp-pose subs` wrote one (D30)."""
+    from . import meta, subs
     layout = record.OutputLayout(Path(out_root))
     rows = meta.load_meta_rows(layout.meta_json('*').parent)
     done = set(committed_videos(out_root))
-    meta.write_video_meta(layout.video_meta_csv, {vid: row for vid, row in rows.items() if vid in done})
+    rows = subs.caption_source_rows({vid: row for vid, row in rows.items() if vid in done},
+                                    subs.load_caption_sources(Path(out_root)))
+    meta.write_video_meta(layout.video_meta_csv, rows)
     return layout.video_meta_csv
 
 
