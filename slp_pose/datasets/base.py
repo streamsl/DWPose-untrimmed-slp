@@ -21,12 +21,14 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass, field
+from fractions import Fraction
 from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from ..rules import Rule, framework_names, framework_rule, is_framework_name
 from ..select import FrameRule
 from ..signer import VideoRule
+from ..subs import Cue
 
 SAFE_ID = re.compile(r'[A-Za-z0-9._-]+')
 SEGMENT_SUFFIX = re.compile(r'_segment_\d+$')   # misaligned-slt names clips <video_id>_segment_<n>
@@ -88,6 +90,8 @@ class Dataset:
             file, an importable module or an installed plugin (datasets.reference).
         split_order: when set, splits are extracted in this order (videos without a split last)
             and every Video.split must be one of them or None.
+        caption_source: what the subtitles of `captions` are, for misaligned-slt's video_meta.csv
+            caption_source column: 'human' (default), 'mt', 'shard' (subs.CAPTION_SOURCES).
 
     The framework constructs it as `cls(data_root)`; an overriding __init__ must call
     super().__init__(data_root). After construction `extraction_rule` is never None.
@@ -98,6 +102,7 @@ class Dataset:
     extraction_rule: Optional[str] = None
     rules: Tuple[Rule, ...] = ()
     split_order: Tuple[str, ...] = ()
+    caption_source: str = 'human'
 
     def __init__(self, data_root: os.PathLike) -> None:
         check_dataset_class(type(self))
@@ -107,6 +112,13 @@ class Dataset:
     def videos(self) -> Iterable[Video]:
         """Every video of the dataset (any order); the framework validates the list."""
         raise NotImplementedError(f'{type(self).__name__}.videos()')
+
+    def captions(self, video: Video, fps: Fraction) -> Optional[Mapping[str, Sequence[Cue]]]:
+        """The subtitle tracks of `video` for `slp-pose subs` (spec D30): {track: cues}, e.g.
+        {'en': [...]} -> subs/<video_id>.en.vtt; None or {} when it has none (the default: a dataset
+        without subtitles). `fps` is the exact frame rate of the committed poses, for subtitles
+        timed in frames. Cue times are seconds of the video's timeline (subs.Cue)."""
+        return None
 
     def out_root(self) -> Path:
         """Default output root: <data root>/<name>/dwpose (override to put it elsewhere)."""

@@ -4,6 +4,18 @@ Layout under the data root: BOBSL/original_data/videos/mp4/<episode id>.mp4 and 
 BOBSL/original_data/metadata/subset2episode.json ({split: [episode id, ...]}). The video id is the
 file stem; outputs go to BOBSL/dwpose/.
 
+Subtitles (D30, user 2026-10-13: both signing-aligned versions, as separate tracks): 'en' =
+automatic_annotations/signing_aligned_subtitles/auto_sat_aligned/<episode id>.vtt (every episode,
+challenge_test included) -> subs/<id>.en.vtt, misaligned-slt's default; 'en-manual' =
+manual_annotations/signing_aligned_subtitles/<episode id>.vtt (55 episodes: 35 test, 4 val, 16
+train) -> subs/<id>.en-manual.vtt, chosen where it exists by putting '.en-manual.vtt' first in
+misaligned-slt's subtitles.preferred_suffixes. The manual files tag cues whose signing does not
+match the subtitle ([SUB-DOES-NOT-MATCH-SIGNS] 1,199, [NOT-SIGNED] 940 incl. 'NOT SIGNED' /
+'NOT_SIGNED', [DUPLICATED] 71, [UNANNOTATED] 8, [NOT-ENGLISH] 5, [INAPPROPRIATE-SIGN] 5); such a cue
+is dropped (misaligned-slt strips bracket tags and would keep the text as a translation target).
+The automatic files carry no tags. The original broadcast subtitles (original_data/subtitles/
+audio-aligned/, timed to the speech) are not used.
+
 Repaired sources (D26): an episode in REPAIRED is damaged in the official BOBSL v1.4 copy itself
 (no download fixes it), so it is read from BOBSL/repaired/<episode id>.mp4 when that file exists,
 else from the original. The repaired copy has the same frames, frame size and frame rate, with the
@@ -16,12 +28,19 @@ then expects decoder errors from it.
 from __future__ import annotations
 
 import json
+import re
+from fractions import Fraction
 from pathlib import Path
 from typing import Dict, List, Tuple
 
 from ..signer import SignerTrackParams, track_rule
+from ..subs import Cue, read_vtt
 from . import register
 from .base import Dataset, Video
+
+AUTO_SUBTITLES = Path('automatic_annotations') / 'signing_aligned_subtitles' / 'auto_sat_aligned'
+MANUAL_SUBTITLES = Path('manual_annotations') / 'signing_aligned_subtitles'
+QUALITY_TAG = re.compile(r'\[[A-Z][A-Z _-]*\]')   # e.g. [NOT-SIGNED]: the manual files' tags (module docstring)
 
 # Episode id -> the frames its repaired copy paints black, as half-open [start, stop) runs: every frame
 # that depends on damaged data (its packets overlap the zero bytes, or it references a frame that does),
@@ -78,6 +97,16 @@ class Bobsl(Dataset):
             out.append(Video(path.stem, source, splits.get(path.stem),
                              known_damage=_DAMAGED_ORIGINAL if damaged else None))
         return out
+
+    def captions(self, video: Video, fps: Fraction) -> Dict[str, List[Cue]]:
+        root, tracks = self.data_root / 'BOBSL', {}
+        auto = root / AUTO_SUBTITLES / f'{video.video_id}.vtt'
+        if auto.is_file():
+            tracks['en'] = read_vtt(auto)
+        manual = root / MANUAL_SUBTITLES / f'{video.video_id}.vtt'
+        if manual.is_file():
+            tracks['en-manual'] = [cue for cue in read_vtt(manual) if not QUALITY_TAG.search(cue.text)]
+        return tracks
 
     def _repaired(self, path: Path) -> Path:
         """The repaired copy of a REPAIRED episode when that file exists, else `path`."""

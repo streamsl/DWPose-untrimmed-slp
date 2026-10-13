@@ -95,6 +95,7 @@ import struct
 import zipfile
 import zlib
 from dataclasses import dataclass
+from fractions import Fraction
 from pathlib import Path
 from typing import Callable, Dict, Iterator, List, Optional, Protocol, Tuple, Union
 
@@ -471,6 +472,13 @@ def save_persons(path: Path, record: PersonsRecord) -> None:
 
 def _meta_json(row: Dict[str, object]) -> str:
     return json.dumps(row, allow_nan=True)
+
+
+def load_persons_fps(path: Path) -> Fraction:
+    """The exact frame rate (num / den) of the persons file at `path`, reading only its fps member."""
+    with zipfile.ZipFile(path) as zf:
+        num, den = (int(x) for x in np.load(io.BytesIO(zf.read('fps.npy'))))
+    return Fraction(num, den)
 
 
 def crc_problems(path: Path, report: Optional[Report] = None) -> List[str]:

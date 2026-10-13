@@ -11,6 +11,12 @@ each video is stored at its own rate, like Auslan News. 3 of the 2,529 videos ar
 rest 1280x720. About 170 video ids start with '-': on the command line pass such an id as
 `--videos=<id>` (one id per option), or select videos with --limit.
 
+Subtitles (D30): one track 'en' = the rows of how2sign_realigned_{train,val,test}.csv (TAB separated)
+whose VIDEO_NAME is the video: SENTENCE from START_REALIGNED to END_REALIGNED (seconds), in sentence
+number order (SENTENCE_ID '<VIDEO_ID>_<number>'). In a TRUNCATED video a sentence that starts after
+the last decoded frame has no poses and is left out (one that straddles the end is kept; misaligned-
+slt treats its end as unreliable).
+
 Truncated sources (D28): a video in TRUNCATED is cut short in the official How2Sign archive itself
 (the archive's zip holds the same bytes, so no download fixes it): its container header states more
 frames than its data holds. Its Video carries the frames that do decode (Video.expected_frames), and
@@ -24,13 +30,19 @@ decoder errors as expected instead of reporting them as a problem (a read fault 
 """
 from __future__ import annotations
 
+import csv
+from fractions import Fraction
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
+from ..subs import Cue
 from . import register
 from .base import Dataset, Video
 
 SPLITS = ('val', 'test', 'train')
+REALIGNED = 'how2sign_realigned_{split}.csv'
+REALIGNED_COLUMNS = ('VIDEO_ID', 'VIDEO_NAME', 'SENTENCE_ID', 'SENTENCE_NAME', 'START_REALIGNED', 'END_REALIGNED',
+                     'SENTENCE')
 # Video id -> the frames its truncated file decodes to (Video.expected_frames, D28).
 TRUNCATED: Dict[str, int] = {
     # train, 24 fps: the container lists 4,340 frames, the data ends after 4,088 (ffmpeg: "partial file"
@@ -74,6 +86,30 @@ class How2Sign(Dataset):
 
     def out_root(self) -> Path:
         return self.source / 'dwpose'
+
+    def captions(self, video: Video, fps: Fraction) -> Dict[str, List[Cue]]:
+        cues = [cue for _, cue in sorted(self._sentences().get(video.video_id, []), key=lambda item: item[0])]
+        if video.video_id in TRUNCATED:
+            last = Fraction(TRUNCATED[video.video_id]) / fps   # the end of the last decoded frame
+            cues = [cue for cue in cues if cue.start < last]
+        return {'en': cues}
+
+    def _sentences(self) -> Dict[str, List[Tuple[int, Cue]]]:
+        """{VIDEO_NAME: [(sentence number, Cue)]} of the three realigned CSVs (read once)."""
+        if getattr(self, '_realigned', None) is None:
+            out: Dict[str, List[Tuple[int, Cue]]] = {}
+            for split in SPLITS:
+                path = self.source / REALIGNED.format(split=split)
+                with open(path, newline='', encoding='utf-8') as f:
+                    reader = csv.DictReader(f, delimiter='\t')
+                    if tuple(reader.fieldnames or ()) != REALIGNED_COLUMNS:
+                        raise ValueError(f'{path}: columns {reader.fieldnames}, expected {REALIGNED_COLUMNS}')
+                    for row in reader:
+                        number = int(row['SENTENCE_ID'].rsplit('_', 1)[1])
+                        cue = Cue(Fraction(row['START_REALIGNED']), Fraction(row['END_REALIGNED']), row['SENTENCE'])
+                        out.setdefault(row['VIDEO_NAME'], []).append((number, cue))
+            self._realigned = out
+        return self._realigned
 
     def videos(self) -> List[Video]:
         return [Video(path.stem, path, split, expected_frames=TRUNCATED.get(path.stem),

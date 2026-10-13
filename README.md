@@ -34,6 +34,7 @@ Outputs, under the dataset's output root:
   persons/<video_id>.npz    the raw record of every frame
   video_meta.csv            one row per finished video
   video_ids.csv             every video of the dataset
+  subs/<video_id>.<track>.vtt  its subtitles, for misaligned-slt (slp-pose subs)
   .state/                   logs, done markers, meta rows, failed.jsonl, gpu.csv, lock (run bookkeeping)
 ```
 
@@ -41,7 +42,8 @@ Outputs, under the dataset's output root:
 |---|---|
 | `poses/<vid>.npy` | `(T, 133, 3)` float32. `T` = decoded frames = ffprobe `nb_frames` (or, for a source truncated in its dataset's archive, the dataset's `Video.expected_frames`), native fps, no resampling. COCO-WholeBody order: 0–16 body, 17–22 feet, 23–90 face, 91–111 left hand, 112–132 right hand (the person's own left and right). Channel 0 = `x / W`, channel 1 = `y / H` of the original frame, channel 2 = the raw DWPose SimCC score (never clipped; it can exceed 1). A frame with no signer is all zeros. |
 | `persons/<vid>.npz` | The raw record: every person candidate (detector score > 0.1) with its box, score and count/pose-set flags; keypoints of the posed people (up to 3 per frame); the signer's index per frame (`kpt_primary`, -1 = none); the meta row; and provenance (git sha, hashes, engine and checkpoint sha256, library versions, GPU). `poses/` and the meta row are pure functions of it. |
-| `video_meta.csv` | `video_id,duration_s,width,height,caption_source,undetected_ratio,masked_runs,empty_runs,handless_runs`, byte-identical to what misaligned-slt's `save_video_meta` writes. `duration_s = T * den / num` from the exact frame rate, so `T / duration_s` gives back the fps. `caption_source` is blank. `undetected_ratio` is the share of frames with nobody in the detector's count set. The three run columns are JSON lists of half-open `[a, b]` frame runs of `poses/` (`[]` = none), computed with the algorithm and constants of misaligned-slt's `prepare_yt25.py` at commit 3eb85af (`meta.MSLT_COMMIT`). The constants are in seconds, converted to frames at the video's own rate: 0.5 s to merge or keep a masked run, 1 s for an empty run, 2 s motion windows, i.e. 13 / 25 / 50 frames at 25 fps and 15 / 30 / 60 at 29.97 fps. `masked_runs` = frames where a second real body (8 or more visible body joints) is present and moves its arms: the standard deviation of its elbows and wrists over a 2 s window is above 0.7 of the signer's shoulder width, or cannot be measured. Each other body is followed as one person by where its shoulders are, not by its detector rank; `empty_runs` = frames whose `poses/` row holds no real body (no signer, or too few visible joints); `handless_runs` = frames whose `poses/` row shows no hand (fewer than 10 of 21 points above 0.3). misaligned-slt cuts masked and empty runs out of the stream and quarantines captions that lie mostly in handless runs. With a per-frame signer rule every posed person counts for `masked_runs`; with a video-level rule (`signer_track_bobsl`, `signer_track_right`: BOBSL, Auslan News) only the posed people whose box centre lies in the interpreter's region (the box of the signer spot the rule used in that frame), so programme footage elsewhere on screen is not cut. The extraction commits each video with an older meta row (no run columns), and the parent derives it right after, so a row with blank run cells only appears for a video that is committed but not derived yet. |
+| `video_meta.csv` | `video_id,duration_s,width,height,caption_source,undetected_ratio,masked_runs,empty_runs,handless_runs`, byte-identical to what misaligned-slt's `save_video_meta` writes. `duration_s = T * den / num` from the exact frame rate, so `T / duration_s` gives back the fps. `caption_source` is `human` for a video with subtitles and `none` without, once `slp-pose subs` has run (blank before). `undetected_ratio` is the share of frames with nobody in the detector's count set. The three run columns are JSON lists of half-open `[a, b]` frame runs of `poses/` (`[]` = none), computed with the algorithm and constants of misaligned-slt's `prepare_yt25.py` at commit 3eb85af (`meta.MSLT_COMMIT`). The constants are in seconds, converted to frames at the video's own rate: 0.5 s to merge or keep a masked run, 1 s for an empty run, 2 s motion windows, i.e. 13 / 25 / 50 frames at 25 fps and 15 / 30 / 60 at 29.97 fps. `masked_runs` = frames where a second real body (8 or more visible body joints) is present and moves its arms: the standard deviation of its elbows and wrists over a 2 s window is above 0.7 of the signer's shoulder width, or cannot be measured. Each other body is followed as one person by where its shoulders are, not by its detector rank; `empty_runs` = frames whose `poses/` row holds no real body (no signer, or too few visible joints); `handless_runs` = frames whose `poses/` row shows no hand (fewer than 10 of 21 points above 0.3). misaligned-slt cuts masked and empty runs out of the stream and quarantines captions that lie mostly in handless runs. With a per-frame signer rule every posed person counts for `masked_runs`; with a video-level rule (`signer_track_bobsl`, `signer_track_right`: BOBSL, Auslan News) only the posed people whose box centre lies in the interpreter's region (the box of the signer spot the rule used in that frame), so programme footage elsewhere on screen is not cut. The extraction commits each video with an older meta row (no run columns), and the parent derives it right after, so a row with blank run cells only appears for a video that is committed but not derived yet. |
+| `subs/<vid>.<track>.vtt` | The video's subtitles for misaligned-slt, written by `slp-pose subs` from the dataset's own annotations (`Dataset.captions`): WebVTT, one cue per block, times rounded to milliseconds, the text on one line as the annotations give it (misaligned-slt cleans it when it loads). `<track>` is `en`, misaligned-slt's default name, or another track such as BOBSL's `en-manual`. A video without subtitles has no file. |
 | `video_ids.csv` | `video_id,split,source`, then the dataset's own columns. `source` is relative to the data root (absolute for a file outside it). It is rewritten at every `extract` start. |
 
 ## 2. Install on a fresh Linux machine with an NVIDIA GPU
@@ -426,6 +428,32 @@ A finished report can be re-gated offline, without a GPU:
 python -c "from slp_pose import parity; r = parity.load_report('OLD/parity_trt.json'); print(parity.gate(r)); parity.write_report(r, 'NEW')"
 ```
 
+### subs
+
+```bash
+slp-pose subs --dataset bobsl
+```
+
+Rewrites `video_ids.csv` with the dataset's current video list and splits, then writes each
+committed video's subtitles to `<out root>/subs/<video_id>.<track>.vtt` from the dataset's own
+annotations (`Dataset.captions`, [section 4](#subtitles)), deletes `.vtt` files no
+video produces any more, and fills `video_meta.csv`'s `caption_source` (`human`, or `none` for a
+video without subtitles). It writes a file only when its bytes change, and it records the sources
+in `.state/captions.json`, so every later rewrite of `video_meta.csv` (a run end, `derive`) keeps
+them. Cues with an empty text or an end that is not after their start are dropped; the log counts
+them per track. It takes the output root's lock, so it refuses to run while `extract` or `derive`
+runs on that root. Run it again after a dataset's annotations or videos change.
+
+### splits
+
+```bash
+slp-pose splits --datasets bobsl auslan_news how2sign --out data/splits.csv
+```
+
+Writes one CSV, `video_id,split,dataset`, with every video of the given datasets: misaligned-slt
+reads the splits of every language from a single file (`splits.signverse_csv`). It refuses two
+datasets that share a video id. A blank split stays blank (misaligned-slt then leaves the video out).
+
 ## 4. Adding a dataset
 
 A dataset is one Python file holding one `Dataset` subclass. This complete example is
@@ -504,6 +532,27 @@ List such cases in the dataset's file, as `how2sign.py` (`TRUNCATED`, `DAMAGED`)
 
 If you will use the outputs in misaligned-slt, avoid dots in video ids: it finds captions by
 cutting `<vid>.<lang>.vtt` at the first dot.
+
+### Subtitles
+
+For misaligned-slt, a dataset with subtitles implements `captions(video, fps)` in its file and
+returns `{track: [Cue(start, end, text), ...]}`, times in seconds of the video. `fps` is the exact
+frame rate of the committed poses (a `Fraction`), for annotations timed in frames. `slp-pose subs`
+writes each track to `subs/<video_id>.<track>.vtt`. Use `en` for the subtitles misaligned-slt
+should take by default, and a name such as `en-manual` (letters, digits and `-`, no dots) for
+another version; misaligned-slt picks one per video by its `subtitles.preferred_suffixes`. Set the
+class attribute `caption_source` when the subtitles are not written by people (`mt`, `shard`). Do
+any cleaning that only your dataset needs here, e.g. dropping cues the annotators marked as unusable;
+misaligned-slt cleans the text itself when it loads it. `slp_pose.datasets.read_vtt` reads a VTT
+file into cues:
+
+```python
+from slp_pose.datasets import Cue, read_vtt
+
+    def captions(self, video, fps):
+        path = self.data_root / self.name / 'subtitles' / f'{video.video_id}.vtt'
+        return {'en': read_vtt(path)} if path.is_file() else None
+```
 
 ### Signer rules
 
@@ -591,7 +640,8 @@ is alone in front of a green screen.
 |---|---|---|---|
 | Videos | 2,212 BBC episodes, 149.4 M frames, 444x444, 25 fps | 125 ABC news broadcasts (V1: 45, 2022–2023; V2: 80, 2023–2025), 5.65 M frames, 1280x720 (six 2025 V2 videos: 1024x576), 29.97 fps (V1) or 25 fps (V2) | 2,529 frontal raw videos (`rgb_front`), 79.1 h, 7.22 M frames, 1280x720 (three 1920x1080), each at its own native rate: 24 fps for 86 %, also 23.976, 30, 50 and 60 fps |
 | Video id | the episode id (file stem), e.g. `5085344787448740525` | `abc_news_YYYY-MM-DD` | How2Sign's `VIDEO_NAME` (the file stem), e.g. `--7E2sU6zP4-5-rgb_front`, so the sentence timings join on it. 170 ids start with `-`: pass such an id as `--videos=<id>` (one per option), or select with `--limit` |
-| Splits | `val` 32, `test` 250, `train` 1658, `challenge_test` 272 (extracted in this order) | V1 from the annotation workbook: `dev` 4, `test` 6, `train` 35; V2: none | the folder: `val` 132, `test` 184, `train` 2213 (extracted in this order) |
+| Splits | `val` 32, `test` 250, `train` 1658, `challenge_test` 272 (extracted in this order) | one split of all 125 videos, V1 and V2 as one dataset: `dev` 8, `test` 16, `train` 101, the split of the StreamSLST Auslan-Daily baselines (`auslan_news.SPLIT_DEV`, `SPLIT_TEST`) | the folder: `val` 132, `test` 184, `train` 2213 (extracted in this order) |
+| Subtitles (`slp-pose subs`) | two signing-aligned tracks: `en` = the automatic ones (`auto_sat_aligned`, every episode, `challenge_test` included), `en-manual` = the manual ones (55 episodes: 35 `test`, 4 `val`, 16 `train`), without the cues the annotators tagged as not matching the signing (`[NOT-SIGNED]`, `[SUB-DOES-NOT-MATCH-SIGNS]`, `[DUPLICATED]`, ...). The original broadcast subtitles (timed to the speech) are not used. | `en`, sign-aligned, normalized alike for both parts: V1 from the workbook (`Subtitle`, `Begin_Frame` / `End_Frame` at the video's exact rate), V2 from `News_V2_Aligned_VTTS`; lowercased, because the V1 annotations are (punctuation kept). `News_V2_Aligned_VTTS_Normalized_Text` is not used: it turns words into their dictionary form (`calls` -> `call`), which changes the sentences. | `en`: the realigned sentences of `how2sign_realigned_*.csv`, in sentence order; a sentence that starts after the end of a truncated video is left out. One train video, `-3H_cIPcw5w-5-rgb_front`, has no sentences. |
 | `video_ids.csv` extras | none | `subset` (`News_V1` / `News_V2`) and `annotation_name`: the workbook's `D_M_YYYY` for V1, the file stem (the VTT name) for V2 | none |
 | Rules | extraction `largest_bbox`, primary `signer_track_bobsl` (its own rule, in `bobsl.py`) | extraction `right_largest`, primary `signer_track_right` (its own rules, in `auslan_news.py`) | extraction and primary `largest_bbox` |
 | Signer policy | the in-vision interpreter at their usual position, or at another place where they look as they do at it. While the interpreter is off screen the frame is zeros, not a programme person, also when a programme person stays on screen for minutes. | the interpreter in the right-hand panel, or centred full screen at the end of a broadcast. A change of interpreter mid-video counts as one signer. An on-site interpreter beside a press-conference speaker is kept as the signer, also while the panel interpreter is off screen, and so is a picture-in-picture interpreter while the panel is gone; the frames between the inset's showings stay zeros, even when a signing interviewee fills the screen. A still speaker, officer or newsreader is not picked. | the largest person, who is the signer: in a pilot of 13 videos (27,175 frames) exactly one person was found in every frame, and `signer_track` wrongly dropped 14 of those signer frames, so the simple rule is the right one. |
@@ -603,13 +653,16 @@ Place the data under the data root like this:
 ```
 <data root>/BOBSL/original_data/videos/mp4/<episode id>.mp4
 <data root>/BOBSL/original_data/metadata/subset2episode.json      {split: [episode id, ...]}
+<data root>/BOBSL/automatic_annotations/signing_aligned_subtitles/auto_sat_aligned/<episode id>.vtt
+<data root>/BOBSL/manual_annotations/signing_aligned_subtitles/<episode id>.vtt
 
 <data root>/Auslan-Daily/News_V1/ABC News With Auslan - D M YYYY.mp4
-<data root>/Auslan-Daily/News_V1_Annotation.xlsx                  splits (its 'EA<n>' Web News rows are skipped)
+<data root>/Auslan-Daily/News_V1_Annotation.xlsx                  V1 subtitles (its 'EA<n>' Web News rows are skipped)
 <data root>/Auslan-Daily/News_V2/ABC News With Auslan - D M YYYY.mp4
+<data root>/Auslan-Daily/News_V2_Aligned_VTTS/ABC News With Auslan - D M YYYY.vtt   V2 subtitles
 
 <data root>/How2Sign/{val,test,train}/<VIDEO_NAME>.mp4            the frontal raw videos
-<data root>/How2Sign/how2sign_realigned_{val,test,train}.csv      sentence timings (not read by slp-pose)
+<data root>/How2Sign/how2sign_realigned_{val,test,train}.csv      sentence timings (the subtitles)
 ```
 
 How2Sign's frame rates are kept: each video is stored at its own rate, which misaligned-slt reads
@@ -624,34 +677,62 @@ data ([71837, 72447) and [73257, 73934), listed in `bobsl.REPAIRED`) painted bla
 stored as empty (no signer). `video_ids.csv` shows the path that was used. Publish such a copy under
 a temporary name and rename it into place.
 
-Two How2Sign sources are damaged as distributed. `cH27PiYX6gI-9-rgb_front` (train) is truncated in
-the official archive: its header lists 4,340 frames but its data ends after 4,088 (the last 10.5 s;
-every sentence ends by 136.7 s). `how2sign.TRUNCATED` gives the worker those 4,088 frames to expect,
-so the normal run extracts it (before, it needed `--allow-frame-mismatch`).
-`G3RvsnzQrXQ-10-rgb_front` has one damaged block near frame 1988 (82.8 s). Both are listed in
-`how2sign.DAMAGED`, so `check` logs their decoder errors as expected.
+Three How2Sign sources are damaged as distributed. Two train videos are truncated in the official
+archive (their zip copies are identical): `cH27PiYX6gI-9-rgb_front` lists 4,340 frames but its data
+ends after 4,088 (the last 10.5 s; every sentence ends by 136.7 s), and `CH7AviIr0-0-8-rgb_front`
+lists 3,792 frames (158 s) but holds only the first 2,133 (88.9 s; 13 of its 26 sentences are
+intact, 12 are lost and 1 is cut). `how2sign.TRUNCATED` gives the worker the frames to expect, so the
+normal run extracts what exists (before, they needed `--allow-frame-mismatch`).
+`G3RvsnzQrXQ-10-rgb_front` (test) has one damaged 16-pixel block in the background near frame 1988
+(82.8 s); its poses there are fine. All three are listed in `how2sign.DAMAGED`, so `check` logs
+their decoder errors as expected.
 
 Only the TV news part of Auslan-Daily is used. The Communication and Web News parts are left out
 because they have too many multi-person videos. The BOBSL licence keeps its outputs local.
 
 ## 6. Using the outputs in misaligned-slt
 
-An output root has the layout of a misaligned-slt language root. To use it, add a language entry
-for it to misaligned-slt's `configs/data.yaml`, with the output root as `root`, and list that entry
-in `active_languages` (and in the `pretrain_languages` pool if it should be pooled):
+An output root has the layout of a misaligned-slt language root: `poses/`, `video_meta.csv` and,
+after `slp-pose subs`, `subs/`. Make the subtitles and one split file, then add the roots to
+misaligned-slt's `configs/data.yaml`:
+
+```bash
+slp-pose subs --dataset bobsl
+slp-pose subs --dataset auslan_news
+slp-pose subs --dataset how2sign
+slp-pose splits --datasets bobsl auslan_news how2sign --out /path/to/data/splits.csv
+```
 
 ```yaml
+active_languages: [bobsl]            # or auslan_news / how2sign; list several to pool them
 languages:
     bobsl:
         name: BSL (BOBSL, slp-pose DWPose)
         target_lang: en_XX
         pretrained_slt: checkpoints/openasl_pose_only_slt.pth
-        root: /path/to/data/BOBSL/dwpose     # the slp-pose output root
-        pose:
-            fps: 25.0      # fallback only: the real fps per video comes from video_meta.csv
-            width: 444
-            height: 444
+        root: /path/to/data/BOBSL/dwpose          # the slp-pose output root
+        pose: {fps: 25.0, width: 444, height: 444}    # fallbacks only: video_meta.csv has the real ones
+    auslan_news:
+        name: Auslan (Auslan-Daily TV news, slp-pose DWPose)
+        target_lang: en_XX
+        pretrained_slt: checkpoints/openasl_pose_only_slt.pth
+        root: /path/to/data/Auslan-Daily/dwpose
+        pose: {fps: 25.0, width: 1280, height: 720}
+    how2sign:
+        name: ASL (How2Sign, slp-pose DWPose)
+        target_lang: en_XX
+        pretrained_slt: checkpoints/openasl_pose_only_slt.pth
+        root: /path/to/data/How2Sign/dwpose
+        pose: {fps: 24.0, width: 1280, height: 720}
+splits:
+    signverse_csv: /path/to/data/splits.csv       # from `slp-pose splits`; one file for every language
+subtitles:
+    preferred_suffixes: [.en.vtt]               # BOBSL: [.en-manual.vtt, .en.vtt] to use the manual subtitles where they exist
 ```
+
+To train on these datasets together with misaligned-slt's own YouTube-SL-25 languages, append the
+rows of `splits.csv` to its SignVerse split CSV instead (the ids do not overlap), with a blank (or
+new) `sign_language` value so its download stage never plans them.
 
 misaligned-slt reads `poses/` and `video_meta.csv` unchanged. Its loader needs the `masked_runs`,
 `empty_runs` and `handless_runs` columns, and `slp-pose` fills all three. The loader takes each
@@ -680,20 +761,15 @@ misaligned-slt's own data has no such region.
 
 Things to know before training:
 
-- **One frame rate per pool:** misaligned-slt gives a batch and a stage-2 pool one frame floor, and
-  it raises when their videos' rates give different frame counts. Auslan News V1 is 29.97 fps and
-  V2 is 25 fps, so they cannot share a pool. Keep V2 out of the splits (as it is now), or register
-  V1 and V2 as two languages with separate roots. A per-subset output root would belong in
-  `slp_pose/datasets/auslan_news.py`. BOBSL is 25 fps throughout. How2Sign mixes five rates in one
-  dataset (24 fps for 86 % of its videos), so its pool needs misaligned-slt to accept mixed rates,
-  or a split of the pool by rate.
-- **Captions:** put them at `<root>/subs/<video_id>.<lang>.vtt` (`.en.vtt` for English). Videos
-  without one are dropped. BOBSL's subtitles and Auslan News V1's workbook need converting first.
-- **Splits:** misaligned-slt takes them from the one CSV that `splits.signverse_csv` names, and
-  refuses to run if none of the ids match. Merge the `video_id,split` rows of `video_ids.csv` into
-  that CSV, with a blank (or new) `sign_language` value so its SignVerse download stage never plans
-  them. It reads `val` as `dev`, and drops videos with any other split or a blank one, e.g. BOBSL
-  `challenge_test` and all of Auslan News V2.
+- **One frame rate per pool:** misaligned-slt 3eb85af gives a batch and a stage-2 pool one frame
+  floor, and it raises when their videos' rates give different frame counts. BOBSL is 25 fps
+  throughout. Auslan News is one dataset with V1 at 29.97 fps and V2 at 25 fps in every split, and
+  How2Sign mixes five rates (24 fps for 86 % of its videos), so their pools need misaligned-slt to
+  accept mixed rates (each video already carries its own rate in `video_meta.csv`).
+- **Captions:** `slp-pose subs` writes them ([section 3](#subs)). misaligned-slt drops a video
+  without one (`caption_source` `none`).
+- **Splits:** misaligned-slt reads `val` as `dev` and drops videos with any other split or a blank
+  one, e.g. BOBSL `challenge_test` (whose subtitles are written all the same).
 - **Case lexicon:** misaligned-slt pools the training captions of every `en_XX` language into one
   case lexicon, stored next to the root (`<root>/../case_lexicon.en_XX.json`). Adding BOBSL or
   Auslan News changes that pool for every English language.
@@ -734,6 +810,7 @@ which ends with `scripts/check_env.py`). A new TensorRT also has to go into `slp
 | `slp_pose/worker.py`, `run.py` | one worker per GPU; scheduling, supervision and the CSV merge |
 | `slp_pose/decodelog.py` | the workers' decode logs: which video's decoding printed errors (for `check`) |
 | `slp_pose/render.py`, `render_batch.py` | `render` and `render-done` |
+| `slp_pose/subs.py` | `subs` and `splits`: the subtitles, `caption_source` and the split CSV for misaligned-slt (D30) |
 | `slp_pose/parity.py` | the parity gate |
 | `slp_pose/model_configs/` | the YOLOX and DWPose configs, shipped as package data and never edited (their sha256 is in the extraction hash) |
 | `models/` | a checkout's models directory, made by `fetch-models` and `build-engines` (its contents are gitignored): checkpoints, `onnx/`, `engines/`, each generated file with a `.sha256` sidecar |

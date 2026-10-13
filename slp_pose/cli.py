@@ -41,6 +41,14 @@ Commands and options (argparse; defaults in brackets):
                  --limit N --follow --poll-s S [300] --no-persons
                  -> render_batch.render_committed (read-only on the output root; logs in <vis-dir>;
                  one run per vis dir); exit code 0 iff no video failed or was left unchecked mid-commit.
+  subs           --dataset --out-root
+                 -> run.write_video_index (video_ids.csv with the dataset's current splits), subs.write_subs
+                 (the dataset's Dataset.captions -> <out-root>/subs/<vid>.<track>.vtt, .state/captions.json),
+                 then run.merge_meta (video_meta.csv caption_source), under the root lock (not while extract
+                 or derive runs on that root), D30.
+  splits         --datasets NAME_OR_FILE... --data-root --out PATH
+                 -> subs.write_splits: one CSV (video_id, split, dataset) of every video of the datasets,
+                 for misaligned-slt's splits.signverse_csv (it reads 'val' as dev), D30.
 Exit codes: 0 success; 1 failure (failed videos, check problems, parity gate, missing models);
 2 bad arguments (incl. an unknown or invalid dataset); 130 interrupted.
 """
@@ -150,6 +158,15 @@ def build_parser() -> argparse.ArgumentParser:
                    help='with --follow: seconds between looks for new commits [300]')
     p.add_argument('--no-persons', dest='persons', action='store_false',
                    help='draw the primary signer only (default: every person and candidate box)')
+
+    p = command('subs', "write misaligned-slt's subs/<vid>.<track>.vtt and video_meta.csv caption_source")
+    _out_root_option(p)
+
+    p = command('splits', "write one split CSV (video_id, split, dataset) for misaligned-slt", dataset=False)
+    p.add_argument('--datasets', nargs='+', required=True, metavar='NAME_OR_FILE',
+                   help='registered or installed dataset names, or dataset .py files')
+    p.add_argument('--data-root', type=Path, help=f'[${paths.DATA_ENV}, else ./data]')
+    p.add_argument('--out', type=Path, required=True, help='the CSV to write')
     return parser
 
 
@@ -342,10 +359,43 @@ def _render_done(args: argparse.Namespace) -> int:
     return 1 if summary.failed or summary.pending else 0
 
 
+def _subs(args: argparse.Namespace) -> int:
+    dataset = _dataset(args)
+    root = _out_root(args, dataset)
+    _setup_logging(root, 'subs')
+    from .datasets import index_table
+    from .run import VIDEO_INDEX, merge_meta, root_lock, write_video_index
+    from .subs import write_subs
+    videos = load_videos(dataset)
+    try:
+        with root_lock(root):
+            write_video_index(root / VIDEO_INDEX, *index_table(videos, dataset.data_root))   # current splits
+            summary = write_subs(dataset, root, videos)
+            merge_meta(root)
+    except RuntimeError as exc:   # the root is locked by a running extract or derive
+        log.error('%s', exc)
+        return 1
+    log.info('%s: %d committed videos, %d with subtitles; %d files written, %d unchanged, %d removed; '
+             'cues per track %s, dropped %s', dataset.name, summary.videos, summary.captioned,
+             summary.files_written, summary.files_unchanged, summary.files_removed, summary.cues, summary.dropped)
+    return 0
+
+
+def _splits(args: argparse.Namespace) -> int:
+    _setup_logging(None, 'splits')
+    from .subs import write_splits
+    data_root = paths.data_root(args.data_root)
+    counts = write_splits([resolve(name, data_root) for name in args.datasets], args.out)
+    for name, splits in counts.items():
+        log.info('%s: %s', name, ', '.join(f'{split or "(none)"} {n}' for split, n in sorted(splits.items())))
+    log.info('wrote %s', args.out)
+    return 0
+
+
 _COMMANDS: Dict[str, Callable[[argparse.Namespace], int]] = {
     'fetch-models': _fetch_models, 'build-engines': _build_engines, 'list-videos': _list_videos,
     'parity': _parity, 'extract': _extract, 'derive': _derive, 'check': _check, 'render': _render,
-    'render-done': _render_done,
+    'render-done': _render_done, 'subs': _subs, 'splits': _splits,
 }
 
 
