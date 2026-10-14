@@ -19,8 +19,8 @@ audio-aligned/, timed to the speech) are not used.
 Repaired sources (D26): an episode in REPAIRED is damaged in the official BOBSL v1.4 copy itself
 (no download fixes it), so it is read from BOBSL/repaired/<episode id>.mp4 when that file exists,
 else from the original. The repaired copy has the same frames, frame size and frame rate, with the
-damaged frames painted black (lossless H.264; BOBSL/repaired/README.txt says how it was made and
-checked). The extractor finds nobody on a black frame, so those frames are stored as empty (no
+damaged frames painted black: the original's own H.264 packets, with only the keyframe intervals that
+contain damaged frames re-encoded (BOBSL/repaired/README.txt says how it was made and checked). The extractor finds nobody on a black frame, so those frames are stored as empty (no
 signer). Publish a repaired copy under a temporary name and rename it into place. An episode read
 from its damaged original (no repaired copy) is declared damaged (Video.known_damage, D28): `check`
 then expects decoder errors from it.
