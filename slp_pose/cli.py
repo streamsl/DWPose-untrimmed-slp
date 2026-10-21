@@ -46,9 +46,10 @@ Commands and options (argparse; defaults in brackets):
                  (the dataset's Dataset.captions -> <out-root>/subs/<vid>.<track>.vtt, .state/captions.json),
                  then run.merge_meta (video_meta.csv caption_source), under the root lock (not while extract
                  or derive runs on that root), D30.
-  splits         --datasets NAME_OR_FILE... --data-root --out PATH
-                 -> subs.write_splits: one CSV (video_id, split, dataset) of every video of the datasets,
-                 for misaligned-slt's splits.signverse_csv (it reads 'val' as dev), D30.
+  splits         --dataset --out-root
+                 -> subs.write_splits: the dataset's own split files in <out-root>: splits.csv, or one
+                 splits_<name>.csv per split it declares (BOBSL: splits_automatic.csv, splits_manual.csv),
+                 each a CSV video_id,split for misaligned-slt's splits.signverse_csv ('val' = dev), D32.
 Exit codes: 0 success; 1 failure (failed videos, check problems, parity gate, missing models);
 2 bad arguments (incl. an unknown or invalid dataset); 130 interrupted.
 """
@@ -162,11 +163,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = command('subs', "write misaligned-slt's subs/<vid>.<track>.vtt and video_meta.csv caption_source")
     _out_root_option(p)
 
-    p = command('splits', "write one split CSV (video_id, split, dataset) for misaligned-slt", dataset=False)
-    p.add_argument('--datasets', nargs='+', required=True, metavar='NAME_OR_FILE',
-                   help='registered or installed dataset names, or dataset .py files')
-    p.add_argument('--data-root', type=Path, help=f'[${paths.DATA_ENV}, else ./data]')
-    p.add_argument('--out', type=Path, required=True, help='the CSV to write')
+    p = command('splits', "write the dataset's split files (video_id, split) for misaligned-slt")
+    _out_root_option(p)
     return parser
 
 
@@ -382,13 +380,12 @@ def _subs(args: argparse.Namespace) -> int:
 
 
 def _splits(args: argparse.Namespace) -> int:
+    dataset = _dataset(args)
+    root = _out_root(args, dataset)
     _setup_logging(None, 'splits')
     from .subs import write_splits
-    data_root = paths.data_root(args.data_root)
-    counts = write_splits([resolve(name, data_root) for name in args.datasets], args.out)
-    for name, splits in counts.items():
-        log.info('%s: %s', name, ', '.join(f'{split or "(none)"} {n}' for split, n in sorted(splits.items())))
-    log.info('wrote %s', args.out)
+    for file_name, splits in write_splits(dataset, root).items():
+        log.info('%s: %s', root / file_name, ', '.join(f'{split} {n}' for split, n in sorted(splits.items())))
     return 0
 
 

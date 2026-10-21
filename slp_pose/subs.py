@@ -16,8 +16,11 @@ is the canonical name). A dataset that has subtitles implements Dataset.captions
 Cue text is written as the dataset gives it; misaligned-slt cleans it at load time
 (data.loader.clean_caption_text), and a dataset normalizes only where its sources disagree.
 
-`write_splits` writes one split CSV (video_id, split, dataset) over several datasets: misaligned-slt
-reads a single splits.signverse_csv for every language (data.loader.build_splits; 'val' = dev).
+`write_splits` writes a dataset's own split files into its output root (spec D32): splits.csv, or one
+splits_<name>.csv per split the dataset declares (Dataset.splits; BOBSL: splits_automatic.csv and
+splits_manual.csv, one per subtitle alignment). Each is a CSV video_id,split that misaligned-slt reads as
+its splits.signverse_csv (data.loader.build_splits; 'val' = dev, other split names and absent videos
+are left out). The datasets are separate benchmarks, so their splits are never merged.
 
 `read_vtt` reads a source WebVTT file leniently (BOM, CRLF, NOTE / STYLE / REGION blocks, cue
 identifiers, multi-line text joined with a space) for datasets that ship VTT subtitles.
@@ -224,28 +227,33 @@ def caption_source_rows(rows: Mapping[str, Mapping[str, object]], sources: Mappi
     return {vid: dict(row, caption_source=sources.get(vid, row.get('caption_source'))) for vid, row in rows.items()}
 
 
-def write_splits(datasets: Sequence['Dataset'], path: Path) -> Dict[str, Dict[str, int]]:
-    """Write `path`: header video_id,split,dataset and one row per video of each dataset (split '' when
-    None), atomically; returns {dataset name: {split: videos}}. ValueError when two datasets share a
-    video id (misaligned-slt keys its split file by id alone)."""
+def write_splits(dataset: 'Dataset', out_root: Path, videos: Optional[Sequence] = None) -> Dict[str, Dict[str, int]]:
+    """Write the split files of `dataset` (Dataset.splits of `videos`, default load_videos(dataset)) into
+    `out_root`: header video_id,split and one row per video of the split, in the dataset's video order,
+    atomically and only when the bytes change; delete the other splits*.csv files there. Returns
+    {file name: {split: videos}}. ValueError for a split name that is not [A-Za-z0-9-]+."""
     import csv
     import io
     from .datasets.base import load_videos
-    rows, seen, counts = [], {}, {}
-    for dataset in datasets:
+    videos = load_videos(dataset) if videos is None else videos
+    order = {video.video_id: i for i, video in enumerate(videos)}
+    out_root = Path(out_root)
+    counts: Dict[str, Dict[str, int]] = {}
+    for name, splits in sorted(dataset.splits(videos).items()):
+        if name and not TRACK.fullmatch(name):
+            raise ValueError(f'{dataset.name}: split name {name!r} must match {TRACK.pattern}')
+        file_name = f'splits_{name}.csv' if name else 'splits.csv'
+        buffer = io.StringIO()
+        writer = csv.writer(buffer, lineterminator='\n')
+        writer.writerow(('video_id', 'split'))
+        writer.writerows((vid, splits[vid]) for vid in sorted(splits, key=lambda vid: order[vid]))
+        out_root.mkdir(parents=True, exist_ok=True)
+        _write_if_changed(out_root / file_name, buffer.getvalue())
         per_split: Dict[str, int] = {}
-        for video in load_videos(dataset):
-            if video.video_id in seen:
-                raise ValueError(f'video id {video.video_id!r} is in both {seen[video.video_id]} and {dataset.name}')
-            seen[video.video_id] = dataset.name
-            rows.append((video.video_id, video.split or '', dataset.name))
-            per_split[video.split or ''] = per_split.get(video.split or '', 0) + 1
-        counts[dataset.name] = per_split
-    buffer = io.StringIO()
-    writer = csv.writer(buffer, lineterminator='\n')
-    writer.writerow(('video_id', 'split', 'dataset'))
-    writer.writerows(rows)
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    _write_if_changed(path, buffer.getvalue())
+        for split in splits.values():
+            per_split[split] = per_split.get(split, 0) + 1
+        counts[file_name] = per_split
+    for path in out_root.glob('splits*.csv'):
+        if path.name not in counts:
+            path.unlink()
     return counts

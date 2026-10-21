@@ -120,6 +120,13 @@ class Dataset:
         timed in frames. Cue times are seconds of the video's timeline (subs.Cue)."""
         return None
 
+    def splits(self, videos: Sequence[Video]) -> Mapping[str, Mapping[str, str]]:
+        """The dataset's split files for `slp-pose splits` (spec D32): {name: {video_id: split}}, one
+        file per name in the output root: '' -> splits.csv, any other name -> splits_<name>.csv (e.g.
+        one split per subtitle track). A video absent from a file has no split there. The default is
+        one file with every video's own split (Video.split; videos without one are left out)."""
+        return {'': {video.video_id: video.split for video in videos if video.split}}
+
     def out_root(self) -> Path:
         """Default output root: <data root>/<name>/dwpose (override to put it elsewhere)."""
         return self.data_root / self.name / 'dwpose'

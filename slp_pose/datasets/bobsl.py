@@ -1,15 +1,22 @@
 """BOBSL (BBC-Oxford British Sign Language): 2,212 BBC episodes with an in-vision interpreter.
 
-Layout under the data root: BOBSL/original_data/videos/mp4/<episode id>.mp4 and the split lists
-BOBSL/original_data/metadata/subset2episode.json ({split: [episode id, ...]}). The video id is the
+Layout under the data root: BOBSL/original_data/videos/mp4/<episode id>.mp4 and the official split
+lists BOBSL/original_data/metadata/subset2episode.json ({split: [episode id, ...]}). The video id is the
 file stem; outputs go to BOBSL/dwpose/.
+
+Splits (D32, user 2026-10-21: one split file per subtitle alignment): splits_automatic.csv = the official
+split of every episode (train, val, test, challenge_test; Video.split), for the automatic subtitles;
+splits_manual.csv = the re-split of the 55 manually aligned episodes by interpreter (train 36 / dev 4 /
+test 15, D34; SPLIT_DEV and SPLIT_TEST below; video_ids.csv's manual_split column), for the manual
+subtitles. Like the official split it is signer-independent: no interpreter is in two splits, and dev
+and test were never in the official train. A model trained on the manual train (which holds interpreter
+A's 20 official-test episodes) is scored on the manual test only.
 
 Subtitles (D30, user 2026-10-13: both signing-aligned versions, as separate tracks): 'en' =
 automatic_annotations/signing_aligned_subtitles/auto_sat_aligned/<episode id>.vtt (every episode,
 challenge_test included) -> subs/<id>.en.vtt, misaligned-slt's default; 'en-manual' =
-manual_annotations/signing_aligned_subtitles/<episode id>.vtt (55 episodes: 35 test, 4 val, 16
-train) -> subs/<id>.en-manual.vtt, chosen where it exists by putting '.en-manual.vtt' first in
-misaligned-slt's subtitles.preferred_suffixes. The manual files tag cues whose signing does not
+manual_annotations/signing_aligned_subtitles/<episode id>.vtt (the 55 episodes of splits_manual.csv)
+-> subs/<id>.en-manual.vtt, chosen with misaligned-slt's subtitles.preferred_suffixes [.en-manual.vtt]. The manual files tag cues whose signing does not
 match the subtitle ([SUB-DOES-NOT-MATCH-SIGNS] 1,199, [NOT-SIGNED] 940 incl. 'NOT SIGNED' /
 'NOT_SIGNED', [DUPLICATED] 71, [UNANNOTATED] 8, [NOT-ENGLISH] 5, [INAPPROPRIATE-SIGN] 5); such a cue
 is dropped (misaligned-slt strips bracket tags and would keep the text as a translation target).
@@ -31,7 +38,7 @@ import json
 import re
 from fractions import Fraction
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Sequence, Tuple
 
 from ..signer import SignerTrackParams, track_rule
 from ..subs import Cue, read_vtt
@@ -63,13 +70,32 @@ PARAMS = SignerTrackParams(link_iou=0.5, max_gap_s=1.0, min_track_s=20.0, window
                            anchor_s=20.0, fit_iou=0.8, fit_scale=1.25, max_scale=1.3, scale_window_s=1.0,
                            min_scale=0.25, point_conf=0.3, other_iou=0.5, other_scale=1.3)
 SIGNER_TRACK_BOBSL = track_rule('signer_track_bobsl', PARAMS)
+# splits_manual.csv: the 55 manually aligned episodes re-split by interpreter (user, 2026-10-21, D34). The official
+# split is signer-independent (BOBSL paper: 39 interpreters, none in two splits); its manual episodes are 16 train
+# (16 interpreters), 4 val (3) and 35 test (3). BOBSL publishes no interpreter ids, so MANUAL_TEST_INTERPRETERS groups
+# the 35 test episodes by interpreter as inferred from face crops (three independent reviews and face-landmark
+# geometry agree; the user confirmed that test episode 5130659699728866130 and train episode 5172231547180314349 are
+# different people; evidence: .scratch/bobsl-manual-split/). Dev = the 4 official-val episodes (3 interpreters); test
+# = every episode of interpreters B and C; train = the 16 official-train episodes and every episode of interpreter A.
+MANUAL_TEST_INTERPRETERS = {
+    'A': ('5952613360146027617', '6065139785314331208', '6111542182483565918', '6144064963339075095', '6164207930460576679',
+          '6177195911563690266', '6184988700225556709', '6212378136168874626', '6230660523457743887', '6231758317098601501',
+          '6233237503835343920', '6233245234776476721', '6237606774065566357', '6242043045785611181', '6262857316295504035',
+          '6313643157087037540', '6342696033864091923', '6358668158244469679', '6368304776366513150', '6372027224521959778'),
+    'B': ('5913604319680134251', '6003446875091426252', '6040895553921856506', '6157795114790944374', '6182391104004934170',
+          '6186362230766820709', '6220140001066210692', '6238338636492809272', '6240919482340977071', '6243537694404620461'),
+    'C': ('5130659699728866130', '5276110913861331583', '5402656112283796519', '5468695099930362251', '5475374633069107138'),
+}
+SPLIT_DEV = ('5224144816887051284', '5242317681679687839', '5294309549287947552', '5439409006429129628')
+SPLIT_TEST = MANUAL_TEST_INTERPRETERS['B'] + MANUAL_TEST_INTERPRETERS['C']
 _DAMAGED_ORIGINAL = ('damaged in the official BOBSL v1.4 archive (zero runs; bobsl.REPAIRED) and read from the '
                      'original, as BOBSL/repaired/ has no copy of it: libav reports decoding errors')
 
 
 @register
 class Bobsl(Dataset):
-    """BOBSL episodes, scheduled val, test, train, challenge_test (spec assumption 2)."""
+    """BOBSL episodes; split = the official split (val, test, train, challenge_test); info: manual_split
+    (dev, test, train for the 55 manually aligned episodes, else '')."""
 
     name = 'bobsl'
     # D13: the interpreter's spot, empty frames when the interpreter is off screen; the parent derives
@@ -88,15 +114,23 @@ class Bobsl(Dataset):
         return self.data_root / 'BOBSL' / 'dwpose'
 
     def videos(self) -> List[Video]:
-        splits = self._splits()
+        official = self._official_splits()
+        manual = {path.stem for path in (self.data_root / 'BOBSL' / MANUAL_SUBTITLES).glob('*.vtt')}
         paths = sorted((self.source / 'videos' / 'mp4').glob('*.mp4'))
         out = []
         for path in paths:
+            vid = path.stem
+            manual_split = ('dev' if vid in SPLIT_DEV else 'test' if vid in SPLIT_TEST else 'train') if vid in manual else ''
             source = self._repaired(path)
-            damaged = path.stem in REPAIRED and source == path
-            out.append(Video(path.stem, source, splits.get(path.stem),
+            damaged = vid in REPAIRED and source == path
+            out.append(Video(vid, source, official.get(vid), dict(manual_split=manual_split),
                              known_damage=_DAMAGED_ORIGINAL if damaged else None))
         return out
+
+    def splits(self, videos: Sequence[Video]) -> Dict[str, Dict[str, str]]:
+        """splits_automatic.csv (the official split) and splits_manual.csv (the manual re-split)."""
+        return {'automatic': {v.video_id: v.split for v in videos if v.split},
+                'manual': {v.video_id: v.info['manual_split'] for v in videos if v.info.get('manual_split')}}
 
     def captions(self, video: Video, fps: Fraction) -> Dict[str, List[Cue]]:
         root, tracks = self.data_root / 'BOBSL', {}
@@ -113,12 +147,13 @@ class Bobsl(Dataset):
         repaired = self.data_root / 'BOBSL' / 'repaired' / path.name
         return repaired if path.stem in REPAIRED and repaired.is_file() else path
 
-    def _splits(self) -> Dict[str, str]:
-        """{episode id: split}; an episode listed twice keeps its first split in split_order."""
+    def _official_splits(self) -> Dict[str, str]:
+        """{episode id: official split}; an episode listed twice keeps its first split in val, test, train,
+        challenge_test."""
         with open(self.source / 'metadata' / 'subset2episode.json', encoding='utf-8') as f:
             raw = json.load(f)
         out: Dict[str, str] = {}
-        rank = {split: i for i, split in enumerate(self.split_order)}
+        rank = {split: i for i, split in enumerate(('val', 'test', 'train', 'challenge_test'))}
         for split in sorted(raw, key=lambda s: rank.get(s, len(rank))):
             for episode in raw[split]:
                 out.setdefault(str(episode), split)

@@ -447,12 +447,15 @@ runs on that root. Run it again after a dataset's annotations or videos change.
 ### splits
 
 ```bash
-slp-pose splits --datasets bobsl auslan_news how2sign --out data/splits.csv
+slp-pose splits --dataset bobsl
 ```
 
-Writes one CSV, `video_id,split,dataset`, with every video of the given datasets: misaligned-slt
-reads the splits of every language from a single file (`splits.signverse_csv`). It refuses two
-datasets that share a video id. A blank split stays blank (misaligned-slt then leaves the video out).
+Writes the dataset's own split files into its output root, each a CSV `video_id,split` listing the
+videos of that split: `splits.csv`, or one `splits_<name>.csv` per split the dataset declares
+(`Dataset.splits`; BOBSL has two, one per subtitle alignment: `splits_automatic.csv` and
+`splits_manual.csv`). It removes the other `splits*.csv` files there. Every dataset keeps its own
+files: the benchmarks are separate datasets, so their splits are never merged. misaligned-slt reads
+a split file as its `splits.signverse_csv` (`val` counts as `dev`).
 
 ## 4. Adding a dataset
 
@@ -554,6 +557,10 @@ from slp_pose.datasets import Cue, read_vtt
         return {'en': read_vtt(path)} if path.is_file() else None
 ```
 
+`slp-pose splits` writes the dataset's split to `splits.csv` from each video's `split`. A dataset
+with several splits, e.g. one per subtitle track, overrides `splits(videos)` and returns
+`{name: {video_id: split}}`; each name becomes `splits_<name>.csv` (BOBSL: `automatic` and `manual`).
+
 ### Signer rules
 
 The workers pose up to 3 people per frame and store them all in `persons/`:
@@ -640,9 +647,9 @@ is alone in front of a green screen.
 |---|---|---|---|
 | Videos | 2,212 BBC episodes, 149.4 M frames, 444x444, 25 fps | 125 ABC news broadcasts (V1: 45, 2022–2023; V2: 80, 2023–2025), 5.65 M frames, 1280x720 (six 2025 V2 videos: 1024x576), 29.97 fps (V1) or 25 fps (V2) | 2,529 frontal raw videos (`rgb_front`), 79.1 h, 7.22 M frames, 1280x720 (three 1920x1080), each at its own native rate: 24 fps for 86 %, also 23.976, 30, 50 and 60 fps |
 | Video id | the episode id (file stem), e.g. `5085344787448740525` | `abc_news_YYYY-MM-DD` | How2Sign's `VIDEO_NAME` (the file stem), e.g. `--7E2sU6zP4-5-rgb_front`, so the sentence timings join on it. 170 ids start with `-`: pass such an id as `--videos=<id>` (one per option), or select with `--limit` |
-| Splits | `val` 32, `test` 250, `train` 1658, `challenge_test` 272 (extracted in this order) | one split of all 125 videos, V1 and V2 as one dataset: `dev` 8, `test` 16, `train` 101, the split of the StreamSLST Auslan-Daily baselines (`auslan_news.SPLIT_DEV`, `SPLIT_TEST`) | the folder: `val` 132, `test` 184, `train` 2213 (extracted in this order) |
-| Subtitles (`slp-pose subs`) | two signing-aligned tracks: `en` = the automatic ones (`auto_sat_aligned`, every episode, `challenge_test` included), `en-manual` = the manual ones (55 episodes: 35 `test`, 4 `val`, 16 `train`), without the cues the annotators tagged as not matching the signing (`[NOT-SIGNED]`, `[SUB-DOES-NOT-MATCH-SIGNS]`, `[DUPLICATED]`, ...). The original broadcast subtitles (timed to the speech) are not used. | `en`, sign-aligned, normalized alike for both parts: V1 from the workbook (`Subtitle`, `Begin_Frame` / `End_Frame` at the video's exact rate), V2 from `News_V2_Aligned_VTTS`; lowercased, because the V1 annotations are (punctuation kept). `News_V2_Aligned_VTTS_Normalized_Text` is not used: it turns words into their dictionary form (`calls` -> `call`), which changes the sentences. | `en`: the realigned sentences of `how2sign_realigned_*.csv`, in sentence order; a sentence that starts after the end of a truncated video is left out. One train video, `-3H_cIPcw5w-5-rgb_front`, has no sentences. |
-| `video_ids.csv` extras | none | `subset` (`News_V1` / `News_V2`) and `annotation_name`: the workbook's `D_M_YYYY` for V1, the file stem (the VTT name) for V2 | none |
+| Splits | two files, one per subtitle alignment. `splits_automatic.csv`: the official split of every episode (`val` 32, `test` 250, `train` 1658, `challenge_test` 272; also `video_ids.csv`'s `split`). `splits_manual.csv`: the 55 manually aligned episodes, re-split by interpreter into `dev` 4, `test` 15, `train` 36 (`bobsl.SPLIT_DEV`, `SPLIT_TEST`; also `video_ids.csv`'s `manual_split`). Like the official split it is signer-independent: dev = the 4 official-val episodes, test = every episode of two of the three official-test interpreters (`bobsl.MANUAL_TEST_INTERPRETERS` B and C), train = the 16 official-train episodes and every episode of the third (A). BOBSL publishes no interpreter ids; the groups were inferred from face crops. A model trained on the manual train, which holds A's 20 official-test episodes, is scored on the manual test only | one split of all 125 videos, V1 and V2 as one dataset: `dev` 8, `test` 16, `train` 101, the split of the StreamSLST Auslan-Daily baselines (`auslan_news.SPLIT_DEV`, `SPLIT_TEST`) | the folder: `val` 132, `test` 184, `train` 2213 (extracted in this order) |
+| Subtitles (`slp-pose subs`) | two signing-aligned tracks: `en` = the automatic ones (`auto_sat_aligned`, every episode, `challenge_test` included), `en-manual` = the manual ones (the 55 episodes of the split), without the cues the annotators tagged as not matching the signing (`[NOT-SIGNED]`, `[SUB-DOES-NOT-MATCH-SIGNS]`, `[DUPLICATED]`, ...). The original broadcast subtitles (timed to the speech) are not used. | `en`, sign-aligned, normalized alike for both parts: V1 from the workbook (`Subtitle`, `Begin_Frame` / `End_Frame` at the video's exact rate), V2 from `News_V2_Aligned_VTTS`; lowercased, because the V1 annotations are (punctuation kept). `News_V2_Aligned_VTTS_Normalized_Text` is not used: it turns words into their dictionary form (`calls` -> `call`), which changes the sentences. | `en`: the realigned sentences of `how2sign_realigned_*.csv`, in sentence order; a sentence that starts after the end of a truncated video is left out. One train video, `-3H_cIPcw5w-5-rgb_front`, has no sentences. |
+| `video_ids.csv` extras | `manual_split` (the split of `splits_manual.csv`; blank for the other episodes) | `subset` (`News_V1` / `News_V2`) and `annotation_name`: the workbook's `D_M_YYYY` for V1, the file stem (the VTT name) for V2 | none |
 | Rules | extraction `largest_bbox`, primary `signer_track_bobsl` (its own rule, in `bobsl.py`) | extraction `right_largest`, primary `signer_track_right` (its own rules, in `auslan_news.py`) | extraction and primary `largest_bbox` |
 | Signer policy | the in-vision interpreter at their usual position, or at another place where they look as they do at it. While the interpreter is off screen the frame is zeros, not a programme person, also when a programme person stays on screen for minutes. | the interpreter in the right-hand panel, or centred full screen at the end of a broadcast. A change of interpreter mid-video counts as one signer. An on-site interpreter beside a press-conference speaker is kept as the signer, also while the panel interpreter is off screen, and so is a picture-in-picture interpreter while the panel is gone; the frames between the inset's showings stay zeros, even when a signing interviewee fills the screen. A still speaker, officer or newsreader is not picked. | the largest person, who is the signer: in a pilot of 13 videos (27,175 frames) exactly one person was found in every frame, and `signer_track` wrongly dropped 14 of those signer frames, so the simple rule is the right one. |
 | Output root | `<data root>/BOBSL/dwpose/` | `<data root>/Auslan-Daily/dwpose/` | `<data root>/How2Sign/dwpose/` |
@@ -693,18 +700,26 @@ because they have too many multi-person videos. The BOBSL licence keeps its outp
 ## 6. Using the outputs in misaligned-slt
 
 An output root has the layout of a misaligned-slt language root: `poses/`, `video_meta.csv` and,
-after `slp-pose subs`, `subs/`. Make the subtitles and one split file, then add the roots to
-misaligned-slt's `configs/data.yaml`:
+after `slp-pose subs`, `subs/`; `slp-pose splits` adds the dataset's own split files. Each dataset is
+a separate benchmark: train and evaluate on one at a time, with its own split file and the subtitle
+track that goes with it.
 
 ```bash
 slp-pose subs --dataset bobsl
-slp-pose subs --dataset auslan_news
-slp-pose subs --dataset how2sign
-slp-pose splits --datasets bobsl auslan_news how2sign --out /path/to/data/splits.csv
+slp-pose splits --dataset bobsl
 ```
 
+| benchmark | `root` | `splits.signverse_csv` | `subtitles.preferred_suffixes` |
+|---|---|---|---|
+| BOBSL, automatic alignment (official split) | `data/BOBSL/dwpose` | `data/BOBSL/dwpose/splits_automatic.csv` | `[.en.vtt]` |
+| BOBSL, manual alignment (55 episodes) | `data/BOBSL/dwpose` | `data/BOBSL/dwpose/splits_manual.csv` | `[.en-manual.vtt]` |
+| Auslan-Daily News | `data/Auslan-Daily/dwpose` | `data/Auslan-Daily/dwpose/splits.csv` | `[.en.vtt]` |
+| How2Sign | `data/How2Sign/dwpose` | `data/How2Sign/dwpose/splits.csv` | `[.en.vtt]` |
+
+For example, BOBSL with its manual alignment in misaligned-slt's `configs/data.yaml`:
+
 ```yaml
-active_languages: [bobsl]            # or auslan_news / how2sign; list several to pool them
+active_languages: [bobsl]
 languages:
     bobsl:
         name: BSL (BOBSL, slp-pose DWPose)
@@ -712,27 +727,14 @@ languages:
         pretrained_slt: checkpoints/openasl_pose_only_slt.pth
         root: /path/to/data/BOBSL/dwpose          # the slp-pose output root
         pose: {fps: 25.0, width: 444, height: 444}    # fallbacks only: video_meta.csv has the real ones
-    auslan_news:
-        name: Auslan (Auslan-Daily TV news, slp-pose DWPose)
-        target_lang: en_XX
-        pretrained_slt: checkpoints/openasl_pose_only_slt.pth
-        root: /path/to/data/Auslan-Daily/dwpose
-        pose: {fps: 25.0, width: 1280, height: 720}
-    how2sign:
-        name: ASL (How2Sign, slp-pose DWPose)
-        target_lang: en_XX
-        pretrained_slt: checkpoints/openasl_pose_only_slt.pth
-        root: /path/to/data/How2Sign/dwpose
-        pose: {fps: 24.0, width: 1280, height: 720}
 splits:
-    signverse_csv: /path/to/data/splits.csv       # from `slp-pose splits`; one file for every language
+    signverse_csv: /path/to/data/BOBSL/dwpose/splits_manual.csv
 subtitles:
-    preferred_suffixes: [.en.vtt]               # BOBSL: [.en-manual.vtt, .en.vtt] to use the manual subtitles where they exist
+    preferred_suffixes: [.en-manual.vtt]
 ```
 
-To train on these datasets together with misaligned-slt's own YouTube-SL-25 languages, append the
-rows of `splits.csv` to its SignVerse split CSV instead (the ids do not overlap), with a blank (or
-new) `sign_language` value so its download stage never plans them.
+misaligned-slt leaves out a video its split file does not list (it prints how many), and a video
+listed with a split other than `train`, `dev` or `val`, `test` (BOBSL's `challenge_test`).
 
 misaligned-slt reads `poses/` and `video_meta.csv` unchanged. Its loader needs the `masked_runs`,
 `empty_runs` and `handless_runs` columns, and `slp-pose` fills all three. The loader takes each
@@ -769,7 +771,7 @@ Things to know before training:
 - **Captions:** `slp-pose subs` writes them ([section 3](#subs)). misaligned-slt drops a video
   without one (`caption_source` `none`).
 - **Splits:** misaligned-slt reads `val` as `dev` and drops videos with any other split or a blank
-  one, e.g. BOBSL `challenge_test` (whose subtitles are written all the same).
+  one, e.g. the 2,157 BOBSL episodes outside the manual split (whose subtitles are written all the same).
 - **Case lexicon:** misaligned-slt pools the training captions of every `en_XX` language into one
   case lexicon, stored next to the root (`<root>/../case_lexicon.en_XX.json`). Adding BOBSL or
   Auslan News changes that pool for every English language.
@@ -810,7 +812,7 @@ which ends with `scripts/check_env.py`). A new TensorRT also has to go into `slp
 | `slp_pose/worker.py`, `run.py` | one worker per GPU; scheduling, supervision and the CSV merge |
 | `slp_pose/decodelog.py` | the workers' decode logs: which video's decoding printed errors (for `check`) |
 | `slp_pose/render.py`, `render_batch.py` | `render` and `render-done` |
-| `slp_pose/subs.py` | `subs` and `splits`: the subtitles, `caption_source` and the split CSV for misaligned-slt (D30) |
+| `slp_pose/subs.py` | `subs` and `splits`: the subtitles, `caption_source` and each dataset's split files for misaligned-slt (D30, D32) |
 | `slp_pose/parity.py` | the parity gate |
 | `slp_pose/model_configs/` | the YOLOX and DWPose configs, shipped as package data and never edited (their sha256 is in the extraction hash) |
 | `models/` | a checkout's models directory, made by `fetch-models` and `build-engines` (its contents are gitignored): checkpoints, `onnx/`, `engines/`, each generated file with a `.sha256` sidecar |
