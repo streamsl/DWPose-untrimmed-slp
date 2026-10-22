@@ -1,4 +1,4 @@
-"""Subtitles for misaligned-slt (spec D30): <out root>/subs/<video id>.<track>.vtt and caption_source.
+"""Subtitles for misaligned-slt: <out root>/subs/<video id>.<track>.vtt and caption_source.
 
 misaligned-slt reads a language root as poses/<vid>.npy + video_meta.csv + subs/<vid>.<track>.vtt
 (data.loader.best_subtitle picks one track per video by its subtitles.preferred_suffixes; '.en.vtt'
@@ -16,7 +16,7 @@ is the canonical name). A dataset that has subtitles implements Dataset.captions
 Cue text is written as the dataset gives it; misaligned-slt cleans it at load time
 (data.loader.clean_caption_text), and a dataset normalizes only where its sources disagree.
 
-`write_splits` writes a dataset's own split files into its output root (spec D32): splits.csv, or one
+`write_splits` writes a dataset's own split files into its output root: splits.csv, or one
 splits_<name>.csv per split the dataset declares (Dataset.splits; BOBSL: splits_automatic.csv and
 splits_manual.csv, one per subtitle alignment). Each is a CSV video_id,split that misaligned-slt reads as
 its splits.signverse_csv (data.loader.build_splits; 'val' = dev, other split names and absent videos

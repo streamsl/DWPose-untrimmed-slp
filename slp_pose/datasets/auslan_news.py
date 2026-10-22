@@ -1,5 +1,5 @@
 """Auslan-Daily TV news (News_V1 + News_V2) as one dataset: readable video ids, one split, the
-annotation names, sign-aligned subtitles (D30) and this dataset's own signer rules.
+annotation names, sign-aligned subtitles and this dataset's own signer rules.
 
 Under <data root>/Auslan-Daily/ the videos are 'ABC News With Auslan - D M YYYY.mp4' in News_V1/
 (2022-2023, sentence annotations in News_V1_Annotation.xlsx, whose Video_Name is 'D_M_YYYY';
@@ -8,18 +8,18 @@ BANZ-FS extension; News_V2_Aligned_VTTS/<file stem>.vtt holds its sign-aligned s
 video id is 'abc_news_YYYY-MM-DD' (unique: the two subsets share no date). The workbook is read with
 zipfile + ElementTree.
 
-Signer rules (spec D14, D21; they serve this dataset only, so they live here and reach the
-framework through AuslanNews.rules, D22). The interpreter stands in a panel on the right, beside
-news footage or a studio newsreader who may be larger, and may hand over to an on-site interpreter
-standing beside a speaker in the footage:
+Signer rules (they serve this dataset only, so they live here and reach the framework through
+AuslanNews.rules). The interpreter stands in a panel on the right, beside news footage or a studio
+newsreader who may be larger, and may hand over to an on-site interpreter standing beside a speaker
+in the footage:
 - `right_largest` (per frame; the GPU workers pose with it): the largest box whose centre lies in
   the right 40 % of the frame, else the largest box, so the panel interpreter is posed.
 - `signer_track_right` (video level; the parent derives it on the CPU): the framework's
-  signer_track steps 1-5 (signer.py; with D24's spot identity, the shoulder widths of the wrist
-  measure) with
+  signer_track steps 1-5 (signer.py; the spot identity uses the shoulder widths that the wrist
+  measure reads) with
   (a) the right prior: the main spot and step-5 ties favour the spot with the larger median box
       centre x;
-  (b) signing motion (signer.signing_boxes on the wrists, D21): a steady segment outside the main
+  (b) signing motion (signer.signing_boxes on the wrists): a steady segment outside the main
       spot's segments (step 5) must sign in at least min_active of its boxes within the window (a
       steady newsreader, reporter or speaker does not);
   (c) step 6, fill_gaps: a gap is a stretch of at least fill_min_s inside a main segment's span
@@ -29,19 +29,18 @@ standing beside a speaker in the footage:
       whose boxes in it at least min_active sign (an on-site interpreter); among several, the one
       with the most signing boxes, then the most boxes, then the earlier segment: its box at t, or
       -1 where it has none, and its spot box as the region. A gap without one stays -1.
-  (d) merge_gap_s 180 s (D25): the panel's segment bridges an absence of up to 3 minutes, so a
-      full-screen insert of the bulletin (a press conference, a picture-in-picture interpreter
+  (d) merge_gap_s 180 s: the panel's segment bridges an absence of up to 3 minutes, so a
+      full-screen insert of the video (a press conference, a picture-in-picture interpreter
       while the panel is gone) is a gap of step 6 and takes one signer for its whole length: a
-      picture-in-picture interpreter who interprets the bulletin is the signer while the inset is
+      picture-in-picture interpreter who interprets the video is the signer while the inset is
       shown, and the frames between its showings stay -1 even when a signing interviewee fills
-      the screen (D25). An absence over 3 minutes ends the segment (the interpreter leaving at the
+      the screen. An absence over 3 minutes ends the segment (the interpreter leaving at the
       end of a broadcast; step 5 then keeps a centred V1 ending).
   Without keypoints (wrists=None) every box counts as signing in step 5, step 6 is skipped and the
   spot identity compares box sizes only; on a record the rule reads the wrists also with the motion
-  test off (min_active 0), for the spot identity's shoulder widths. Its parameters (PARAMS, spelled
-  out here) and their hashed form (RightTrackParams.fingerprint) are D21's with D24's spot identity
-  and D25's merge gap.
-  Known limit (D21, D25): at a handover in a split screen, the idle outgoing panel interpreter stays
+  test off (min_active 0), for the spot identity's shoulder widths. Its parameters are PARAMS,
+  spelled out here; RightTrackParams.fingerprint is their hashed form.
+  Known limit: at a handover in a split screen, the idle outgoing panel interpreter stays
   the signer for up to about 0.7 s after the incoming one starts signing (abc_news_2022-10-30
   around 1476 s); preferring the signing candidate at a handover would belong in this file's
   motion test.
@@ -87,8 +86,8 @@ def right_largest(boxes: np.ndarray, scores: np.ndarray, frame_size: Optional[Tu
     return int(np.argmax(np.where(right, area, -np.inf))) if right.any() else int(np.argmax(area))
 
 
-# No params: the name alone is in the extraction hash, as before D22 (RIGHT_MIN_X is part of what
-# the name means; a changed rule needs a new name).
+# No params: the name alone is in the extraction hash (RIGHT_MIN_X is part of what the name means; a
+# changed rule needs a new name).
 RIGHT_LARGEST = FrameRule('right_largest', right_largest)
 
 
@@ -101,7 +100,7 @@ def right_prior(boxes: np.ndarray) -> float:
 @dataclass(frozen=True)
 class RightTrackParams:
     """Parameters of `signer_track_right` (module docstring): the spot rule's (track, with the right
-    prior), the signing-motion measure's (motion) and this rule's own (D21). The motion test is on
+    prior), the signing-motion measure's (motion) and this rule's own. The motion test is on
     when min_active > 0; fill_gaps needs it."""
 
     track: SignerTrackParams = SignerTrackParams(link_iou=0.5, max_gap_s=1.0, min_track_s=20.0, window_s=60.0,
@@ -127,14 +126,15 @@ class RightTrackParams:
 
     @property
     def uses_motion(self) -> bool:
-        """Whether the rule tests signing motion (D21); without it, it is signer_track with the right prior."""
+        """Whether the rule tests signing motion; without it, it is signer_track with the right prior."""
         return self.min_active > 0
 
     def fingerprint(self) -> Dict[str, object]:
         """The flat dict hashed into the derivation hash (VideoRule.params): the track's, the motion
-        measure's and this rule's own parameters in one dict (D21's keys as signer.rule_params gave
-        them before D22, plus D24's; the one point_conf is both the track's and the motion's; D29's
-        step-5 gate is off, so SignerTrackParams.fingerprint leaves its fields out)."""
+        measure's and this rule's own parameters in one dict (the one point_conf is both the track's
+        and the motion's; the step-5 gate is off, so SignerTrackParams.fingerprint leaves its fields
+        out). The committed Auslan News outputs carry the hash of exactly these keys: a change of
+        them re-derives every video."""
         own = {name: getattr(self, name) for name in ('min_active', 'fill_gaps', 'fill_min_s', 'fill_cover')}
         return dict(self.track.fingerprint(), **dataclasses.asdict(self.motion), **own)
 
@@ -215,16 +215,16 @@ SIGNER_TRACK_RIGHT = VideoRule('signer_track_right', _choose, PARAMS.fingerprint
 
 
 # --------------------------------------------------------------------------- the dataset
-# Video id -> why decoding it prints errors (Video.known_damage, D28): damaged as downloaded.
+# Video id -> why decoding it prints errors (Video.known_damage): damaged as downloaded.
 DAMAGED: Dict[str, str] = {
-    'abc_news_2022-09-11': 'one damaged macroblock in frame 2753 (91.9 s) since the original download, about '
-                           '120 px from the interpreter (2026-10-04 audit; poses unaffected)',
+    'abc_news_2022-09-11': 'one damaged macroblock in frame 2753 (91.9 s) of the source as downloaded, about '
+                           '120 px from the interpreter (poses unaffected)',
 }
 
 
-# One split of the 125 videos, News_V1 and News_V2 as one dataset (user, 2026-10-13): the split of the
-# StreamSLST Auslan-Daily baselines (data_real/auslan_daily_split.json; whole videos, stratified by subset
-# and year), so misaligned-slt is compared with them on the same videos. Every other video is train (101).
+# One split of the 125 videos, News_V1 and News_V2 as one dataset: the split of the StreamSLST
+# Auslan-Daily baselines (whole videos, stratified by subset and year), so misaligned-slt is compared
+# with them on the same videos. Every other video is train (101).
 SPLIT_DEV = ('abc_news_2022-10-23', 'abc_news_2022-11-13', 'abc_news_2023-02-05', 'abc_news_2023-06-11',
              'abc_news_2023-10-01', 'abc_news_2024-03-31', 'abc_news_2024-04-14', 'abc_news_2024-07-07')
 SPLIT_TEST = ('abc_news_2022-07-03', 'abc_news_2022-09-18', 'abc_news_2022-10-09', 'abc_news_2022-10-30',
@@ -242,7 +242,7 @@ def split_of(vid: str) -> str:
 class AuslanNews(Dataset):
     """News_V1 + News_V2 as one dataset; split = split_of; info: subset, annotation_name.
 
-    Subtitles (`captions`, D30): one track 'en', sign-aligned, normalized the same way for both
+    Subtitles (`captions`): one track 'en', sign-aligned, normalized the same way for both
     subsets: News_V1 = the workbook rows of the video (Video_Name = annotation_name; Subtitle,
     Begin_Frame / End_Frame at the video's exact frame rate), News_V2 = the cues of
     News_V2_Aligned_VTTS/<annotation_name>.vtt. The V1 annotations are lowercase, so every text is

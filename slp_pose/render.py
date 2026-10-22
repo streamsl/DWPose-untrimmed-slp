@@ -1,4 +1,4 @@
-"""Overlay renderer for SAVED keypoints (spec §4.5, D2).
+"""Overlay renderer for SAVED keypoints.
 
 CPU only: it reads the saved files, never initialises CUDA or builds a model, and streams one decoded
 frame at a time, so memory stays flat for any video or window length. `poses/<vid>.npy` and the
@@ -8,7 +8,6 @@ The COCO-WholeBody-133 skeleton and colours come from mmpose's coco_wholebody me
 """
 from __future__ import annotations
 
-import errno
 import functools
 import os
 import subprocess
@@ -27,8 +26,8 @@ if TYPE_CHECKING:
     from .record import PersonsRecord
 
 # mmpose's dataset metainfo, relative to the mmpose package directory: a wheel ships it under .mim/; an
-# editable install links .mim/configs to ../configs, a link some filesystems cannot follow (ntfs-3g reads
-# the ntfs3 driver's directory symlinks as 'unsupported reparse tag'), so the source tree is the fallback.
+# editable install links .mim/configs to ../configs, a link some filesystems cannot follow, so the source
+# tree is the fallback.
 COCO_WHOLEBODY_METAINFO = Path('configs') / '_base_' / 'datasets' / 'coco_wholebody.py'
 METAINFO_ROOTS = (Path('.mim'), Path('..'))
 # BGR colours of everything that is not the primary's skeleton.
@@ -77,7 +76,7 @@ def coco_wholebody_skeleton() -> Skeleton:
 
 
 class FrameCursor:
-    """Forward-only, frame-exact decoding with `video.read_frames` semantics.
+    """Forward-only, frame-exact decoding.
 
     Frames are decoded sequentially from frame 0 with cv2's FFmpeg backend and never seeked (cv2
     seeking is not frame-exact for every codec). Reads must move forward, so any number of windows
@@ -255,8 +254,8 @@ def render_video(root: Path, video: VideoInfo, out_path: Path, start_frame: int 
 
     - Reads <root>/poses/<vid>.npy with mmap (only the needed rows) and, with `persons`,
       <root>/persons/<vid>.npz (all posed people and every candidate box), also memory-mapped.
-    - Frame-exact: frame i of the output is decoded frame start_frame + i (video.read_frames
-      semantics; never trust cv2 seeking).
+    - Frame-exact: frame i of the output is decoded frame start_frame + i (FrameCursor; never trust
+      cv2 seeking).
     - Keypoints are stored as x/W, y/H: pixel = (x * W, y * H). Joints and limbs with score
       < score_thr are hidden. Primary signer in the COCO-133 colours from the metainfo
       (skeleton_links, keypoint/link colours); with `persons`, the other posed people in grey with
@@ -316,20 +315,10 @@ def render_video(root: Path, video: VideoInfo, out_path: Path, start_frame: int 
 def durable_replace(src: Path, dst: Path) -> None:
     """os.replace(src, dst) with src fsynced before and dst's directory after, so that after a crash
     `dst` is either its old file or all of `src` (ffmpeg itself never fsyncs)."""
-    _fsync(src)
+    from .record import fsync_path
+    fsync_path(src)
     os.replace(src, dst)
-    _fsync(Path(dst).parent)
-
-
-def _fsync(path: Path) -> None:
-    fd = os.open(str(path), os.O_RDONLY)
-    try:
-        os.fsync(fd)
-    except OSError as e:
-        if e.errno != errno.EINVAL:   # some filesystems cannot fsync a directory; renames stay atomic
-            raise
-    finally:
-        os.close(fd)
+    fsync_path(Path(dst).parent)
 
 
 def _check_encoded(path: Path, video: VideoInfo, num_frames: int) -> None:

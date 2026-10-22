@@ -1,4 +1,4 @@
-"""Primary-signer rules by name: the framework's own, and a dataset's (spec D14, D22).
+"""Primary-signer rules by name: the framework's own, and a dataset's.
 
 A rule is a select.FrameRule (per frame: the GPU workers pose with one, and `derive` can re-pick
 with one) or a signer.VideoRule (the whole video: `derive` applies it on the CPU). Records, hashes,
@@ -7,10 +7,8 @@ logs and the CLI name rules. The framework's rules are generic: `largest_bbox`, 
 is defined in that dataset's file and listed in its Dataset.rules, and Dataset.rule(name) resolves
 the dataset's names and the framework's; a dataset never reuses a framework rule's name.
 
-Functions taking a rule accept a rule object (e.g. from Dataset.rule) or a rule name: the
-framework's, else a built-in dataset's own (datasets.builtin_rule; callers from before D22 name
-Auslan News' rules so).
-Pure numpy; must not import torch.
+Functions taking a rule accept a rule object (e.g. from Dataset.rule) or a framework rule's name (a
+dataset's own rule is passed as the object). Pure numpy; must not import torch.
 """
 from __future__ import annotations
 
@@ -42,14 +40,11 @@ def framework_rule(name: str) -> Rule:
 
 
 def as_rule(rule: RuleLike) -> Rule:
-    """`rule` itself (a FrameRule or VideoRule), or the rule of that name: the framework's, else a
-    built-in dataset's own (KeyError for another name). A rule object may not carry a framework
-    rule's name unless it is that rule (ValueError)."""
+    """`rule` itself (a FrameRule or VideoRule), or the framework's rule of that name (KeyError for
+    another name). A rule object may not carry a framework rule's name unless it is that rule
+    (ValueError)."""
     if isinstance(rule, str):
-        if is_framework_name(rule):
-            return framework_rule(rule)
-        from .datasets import builtin_rule   # here, as the datasets import this module
-        return builtin_rule(rule)
+        return framework_rule(rule)
     if not isinstance(rule, (FrameRule, VideoRule)):
         raise TypeError(f'expected a rule name, FrameRule or VideoRule, got {rule!r}')
     if is_framework_name(rule.name) and rule != framework_rule(rule.name):
@@ -63,7 +58,3 @@ def as_frame_rule(rule: RuleLike) -> FrameRule:
     if not isinstance(out, FrameRule):
         raise KeyError(f'{out.name!r} is a video-level rule, not a per-frame rule')
     return out
-
-
-def is_video_rule(rule: Rule) -> bool:
-    return isinstance(rule, VideoRule)

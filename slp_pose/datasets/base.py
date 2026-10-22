@@ -5,7 +5,7 @@ examples/my_dataset.py). The subclass sets a `name`, optionally the signer rules
 order, and implements `videos()`. Everything else (checking ids, files, splits and rules,
 scheduling, the video index, extraction, derive, check, render) is the framework's job.
 
-Extension point (spec D22): a rule that serves this dataset only is defined in its file and listed
+Extension point: a rule that serves this dataset only is defined in its file and listed
 in `rules`, as a select.FrameRule (a per-frame rule the GPU workers can pose with) or a
 signer.VideoRule (a video-level rule that picks the final signer from the posed people, applied by
 `derive` on the CPU), built from scratch or from the framework's building blocks (select.py,
@@ -52,17 +52,16 @@ class Video:
         info: extra str columns for <out root>/video_ids.csv (e.g. the name in the annotations).
         expected_frames: the number of frames the file really decodes to, for a source whose
             container header states another nb_frames (truncated in the dataset's official archive,
-            so no download fixes it; D28), else None. The GPU worker then requires exactly this many
+            so no download fixes it), else None. The GPU worker then requires exactly this many
             decoded frames instead of ffprobe's nb_frames (VideoInfo.frame_count; just as strict), so
             such a video needs no --allow-frame-mismatch run. A positive int; never hashed. List the
             known cases in the dataset's file (how2sign.TRUNCATED).
-        known_damage: why decoding this source prints errors (it is damaged in the dataset's own
-            archive, as read from `path`), else None. `check` reports a video whose committed
-            decode printed decoder errors (decodelog.py, D28) as a problem unless this is set; then it
-            logs them with this note. The note covers every decoder line of the video, so a read
-            fault elsewhere in such a source is not reported either (view its poses instead). A
-            non-empty str; never hashed. List the cases in the dataset's file (how2sign.DAMAGED,
-            bobsl.REPAIRED).
+        known_damage: why decoding this source prints errors (the file at `path` is itself damaged),
+            else None. `check` reports a video whose committed decode printed decoder errors
+            (decodelog.py) as a problem unless this is set; then it logs them with this note. The
+            note covers every decoder line of the video, so a read fault elsewhere in such a source
+            is not reported either (view its poses instead). A non-empty str; never hashed. List the
+            cases in the dataset's file (how2sign.DAMAGED, auslan_news.DAMAGED).
     """
 
     video_id: str
@@ -83,7 +82,7 @@ class Dataset:
         extraction_rule: name of the per-frame rule the GPU workers select and pose with; None
             means primary_rule, which must then be per-frame. A video-level primary rule chooses
             among the posed people, so pick an extraction rule that poses the signer.
-        rules: the dataset's own rules (module docstring; D22), a tuple of select.FrameRule and
+        rules: the dataset's own rules (module docstring), a tuple of select.FrameRule and
             signer.VideoRule with distinct names [A-Za-z0-9._-]+ that are not the framework's
             (largest_bbox, highest_score, signer_track). A per-frame rule of a dataset is resolved
             again inside the spawned GPU workers, so define the dataset at module level of a .py
@@ -114,14 +113,14 @@ class Dataset:
         raise NotImplementedError(f'{type(self).__name__}.videos()')
 
     def captions(self, video: Video, fps: Fraction) -> Optional[Mapping[str, Sequence[Cue]]]:
-        """The subtitle tracks of `video` for `slp-pose subs` (spec D30): {track: cues}, e.g.
+        """The subtitle tracks of `video` for `slp-pose subs`: {track: cues}, e.g.
         {'en': [...]} -> subs/<video_id>.en.vtt; None or {} when it has none (the default: a dataset
         without subtitles). `fps` is the exact frame rate of the committed poses, for subtitles
         timed in frames. Cue times are seconds of the video's timeline (subs.Cue)."""
         return None
 
     def splits(self, videos: Sequence[Video]) -> Mapping[str, Mapping[str, str]]:
-        """The dataset's split files for `slp-pose splits` (spec D32): {name: {video_id: split}}, one
+        """The dataset's split files for `slp-pose splits`: {name: {video_id: split}}, one
         file per name in the output root: '' -> splits.csv, any other name -> splits_<name>.csv (e.g.
         one split per subtitle track). A video absent from a file has no split there. The default is
         one file with every video's own split (Video.split; videos without one are left out)."""

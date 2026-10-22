@@ -1,8 +1,8 @@
 """Dataset registry: built-in datasets, installed plugins and dataset files.
 
 A dataset is ONE Python file with one Dataset subclass (base.py; README 'Adding a dataset';
-examples/my_dataset.py), including any signer rules of its own (Dataset.rules, D22;
-examples/custom_rules.py; a built-in dataset's own rules also resolve by name alone, builtin_rule).
+examples/my_dataset.py), including any signer rules of its own (Dataset.rules;
+examples/custom_rules.py).
 `resolve(name_or_path, data_root)` finds it, in this order:
 1. a path to a .py file: imported by path; it must define, or @register, exactly one Dataset subclass;
 2. 'package.module:ClassName': that class, after importing the module (what `reference` gives a
@@ -24,7 +24,6 @@ from pathlib import Path
 from types import ModuleType
 from typing import Dict, List, Optional, Type, TypeVar, Union
 
-from ..rules import Rule, framework_names
 from ..select import FrameRule
 from ..signer import PosedPeople, SignerChoice, VideoRule
 from ..subs import Cue, read_vtt
@@ -32,8 +31,8 @@ from .base import (INDEX_COLUMNS, Dataset, DatasetError, Video, check_dataset_cl
                    safe_id, schedule)
 
 __all__ = ['BUILTIN', 'Cue', 'ENTRY_POINT_GROUP', 'INDEX_COLUMNS', 'Dataset', 'DatasetError', 'FrameRule',
-           'PosedPeople', 'SignerChoice', 'Video', 'VideoRule', 'builtin_rule', 'dataset_class', 'index_table',
-           'load_videos', 'names', 'read_vtt', 'reference', 'register', 'resolve', 'safe_id', 'schedule']
+           'PosedPeople', 'SignerChoice', 'Video', 'VideoRule', 'dataset_class', 'index_table', 'load_videos',
+           'names', 'read_vtt', 'reference', 'register', 'resolve', 'safe_id', 'schedule']
 
 ENTRY_POINT_GROUP = 'slp_pose.datasets'
 BUILTIN = ('bobsl', 'auslan_news', 'how2sign')   # modules slp_pose.datasets.<name>, each registers its dataset <name>
@@ -102,21 +101,6 @@ def reference(dataset: Union[Dataset, Type[Dataset]]) -> Optional[str]:
     if found is not cls or cls.__module__ in ('__main__', '__mp_main__'):
         return None
     return f'{cls.__module__}:{cls.__qualname__}'
-
-
-def builtin_rule(name: str) -> Rule:
-    """The own rule `name` of the first built-in dataset (BUILTIN) that has one: how a rule name
-    given without its dataset resolves when it is not the framework's (rules.as_rule,
-    worker.task_rule). Records, task pickles and scripts from before D22 name Auslan News' rules
-    like the framework's. KeyError for another name."""
-    own: Dict[str, Rule] = {}
-    for module in BUILTIN:
-        for rule in dataset_class(module).rules:
-            own.setdefault(rule.name, rule)
-    if name not in own:
-        raise KeyError(f"unknown rule {name!r}; the framework's rules: {framework_names()}, the built-in datasets' "
-                       f"own: {sorted(own)} (another dataset's own rules resolve through its Dataset.rule)")
-    return own[name]
 
 
 def _load_builtins() -> None:

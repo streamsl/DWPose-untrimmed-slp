@@ -1,4 +1,4 @@
-"""Parity gate vs the official per-image reference (spec §4.7 item 3).
+"""Parity gate vs the official per-image reference.
 
 Reference ("official") for one frame, strict fp32 (env.strict_fp32), flip on, native frames:
   det = mmdet.apis.inference_detector(engines.build_detector(...), frame)  # one image per call
@@ -7,7 +7,7 @@ Reference ("official") for one frame, strict fp32 (env.strict_fp32), flip on, na
   kpts = mmpose.apis.inference_topdown(engines.build_pose_model(...), frame, pose_set_boxes)
   (frames with an empty pose set are skipped, no full-image fallback).
 Ours = worker.ChunkProcessor on video.chunk_from_frames(...) of the same decoded frames
-(read_frames semantics, one forward decoding pass per video), with the requested backend.
+(decoded frame-exactly from frame 0, one forward pass per video), with the requested backend.
 
 Comparison, per frame:
 - The official and our pose-set boxes are paired one-to-one (closest first, L-inf distance
@@ -59,7 +59,6 @@ import contextlib
 import dataclasses
 import json
 import math
-import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -68,6 +67,7 @@ from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Sequence, Tupl
 import numpy as np
 
 from .datasets import Dataset, Video, load_videos
+from .record import atomic_write_text
 from .settings import Settings
 from .types import COUNT_SET, POSE_SET, ChunkDets, ChunkPoses, VideoInfo
 
@@ -100,7 +100,7 @@ Rule = Callable[[np.ndarray, np.ndarray, Optional[Tuple[int, int]]], int]   # a 
 
 @dataclass(frozen=True)
 class ParityThresholds:
-    """Acceptance thresholds of the lossless gate (spec §4.7 item 3)."""
+    """Acceptance thresholds of the lossless gate."""
 
     conf_thr: float = 0.3                  # a keypoint is 'confident' when the official score > this
     step_tol: float = 1.5                  # a keypoint moved when it moved > this many SimCC steps (> sqrt(2))
@@ -137,7 +137,7 @@ class ParityReport:
     kp_frac_gt_1px: Dict[str, float] = field(default_factory=dict)   # 'all', 'lhand', 'rhand', 'body', 'face', 'feet'
     kp_max_diff_px: Dict[str, float] = field(default_factory=dict)
     notes: List[str] = field(default_factory=list)
-    # Additions to the contract fields:
+    # Further detail:
     primary_rule: str = ''                          # the dataset's final rule (informational)
     extraction_rule: str = ''                       # the per-frame rule compared (ours and official)
     complete: bool = False                          # False while run_parity is still going (partial JSON)
@@ -604,7 +604,8 @@ def plan_windows(dataset: Dataset, num_videos: int = 20, windows: int = 3,
 
 # --------------------------------------------------------------------------- the run
 class _HeadNmsExt:
-    """mmcv's compiled ops module, except that nms of CUDA boxes runs detpost.head_nms (D27)."""
+    """mmcv's compiled ops module, except that nms of CUDA boxes runs detpost.head_nms (on a GPU that
+    mmcv's prebuilt CUDA code does not cover)."""
 
     def __init__(self, ext) -> None:
         self._ext = ext
@@ -774,7 +775,7 @@ Limit = Dict[str, object]   # a gate_limits entry
 
 
 def gate_limits(report: ParityReport, thresholds: ParityThresholds = ParityThresholds()) -> Dict[str, Limit]:
-    """The jitter-relative gate metrics (D17), keyed 'kp_frac_gt_step.<part>' and
+    """The jitter-relative gate metrics, keyed 'kp_frac_gt_step.<part>' and
     'kp_frac_flipped.<part>' for the GATED_PARTS, then 'score_max_diff'. Each entry is {'value': the
     report's number, 'fixed': the ParityThresholds limit, 'jitter': the same number of the report's
     GATE_JITTER baseline (None without one), 'effective': max(fixed, jitter_factor x jitter), or
@@ -818,7 +819,7 @@ def gate(report: ParityReport, thresholds: ParityThresholds = ParityThresholds()
     steps (max_kp_frac_gt_step) and the share moving > flip_tol steps (any SimCC argmax flip,
     max_kp_frac_flipped: rare noise flips pass, a systematic one-bin shift does not). With a
     GATE_JITTER baseline in the report each of those may reach jitter_factor x the baseline's value
-    of the same metric and part (D17: at 720p the official code's flips vs itself exceed the fixed
+    of the same metric and part (at 720p the official code's flips vs itself exceed the fixed
     limits); without one the fixed limits apply. The > 1 px / > 2 px shares and px percentiles are
     informational (a SimCC step is ~1 px or more for large people at 720p, so a px threshold is
     resolution-dependent).
@@ -960,12 +961,6 @@ def summary_markdown(report: ParityReport, thresholds: ParityThresholds = Parity
     return '\n'.join(lines) + '\n'
 
 
-def _atomic_write(path: Path, text: str) -> None:
-    tmp = path.with_name(path.name + '.tmp')
-    tmp.write_text(text)
-    os.replace(tmp, path)
-
-
 def write_report(report: ParityReport, out_dir: Path, thresholds: ParityThresholds = ParityThresholds()) -> Path:
     """Write <out_dir>/parity_<backend>.json (the report, plus the gate verdict and gate_limits once
     complete) and parity_<backend>.md, each atomically; returns the JSON path."""
@@ -977,8 +972,8 @@ def write_report(report: ParityReport, out_dir: Path, thresholds: ParityThreshol
         data['gate'] = dict(passed=passed, reasons=reasons, thresholds=dataclasses.asdict(thresholds),
                             limits=gate_limits(report, thresholds))
     path = out_dir / f'parity_{report.backend}.json'
-    _atomic_write(path, json.dumps(data, indent=1) + '\n')
-    _atomic_write(path.with_suffix('.md'), summary_markdown(report, thresholds))
+    atomic_write_text(path, json.dumps(data, indent=1) + '\n')
+    atomic_write_text(path.with_suffix('.md'), summary_markdown(report, thresholds))
     return path
 
 

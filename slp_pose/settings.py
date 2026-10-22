@@ -2,11 +2,7 @@
 
 Everything that changes GPU output is listed by `Settings.extraction_fields` (plus the dataset's
 extraction rule when it changes which people are posed, record.extraction_hash); everything a CPU
-`derive` may change is listed by `Settings.derivation_fields` (spec §4.4).
-
-Settings objects are pickled to the GPU workers, and a respawned worker unpickles Settings made by
-the parent's (possibly older) code: fields are only ever added, each with a plain default (a
-missing field then reads the class default), and never renamed or removed.
+`derive` may change is listed by `Settings.derivation_fields`.
 """
 from __future__ import annotations
 
@@ -30,12 +26,11 @@ class PrecisionProfile:
 
     name: str
     tf32: bool      # allow TF32 tensor-core math (TRT BuilderFlag.TF32, torch allow_tf32)
-    lossless: bool  # measured and approved as lossless vs strict fp32 (spec D5/D7)
 
 
-# Only the lossless tier exists for now; lossy tiers are added here once measured and approved.
+# Precision tiers: strict fp32 (TF32 off) is the only one.
 PRECISION_PROFILES: Dict[str, PrecisionProfile] = {
-    'fp32': PrecisionProfile('fp32', tf32=False, lossless=True),
+    'fp32': PrecisionProfile('fp32', tf32=False),
 }
 BACKENDS = ('trt', 'torch')
 
@@ -45,7 +40,7 @@ class Settings:
     """Frozen run configuration. Nothing is hardcoded: configs ship with the package, checkpoints,
     ONNX and engines live in `models_dir` (paths.models_dir() unless given)."""
 
-    # Detection thresholds (spec D8). The head's own score_thr 0.01 / NMS 0.65 come from the
+    # Detection thresholds. The head's own score_thr 0.01 / NMS 0.65 come from the
     # detector config (engines.DetMeta), not from here.
     cand_score_thr: float = 0.1    # stored person candidates: score > this
     pose_score_thr: float = 0.3    # pose set: score > this, then mmpose legacy NMS
@@ -53,8 +48,8 @@ class Settings:
     count_score_thr: float = 0.3   # count set: score > this, then torchvision NMS
     count_nms_thr: float = 0.45
     # Pose
-    max_posed: int = 3             # K: people posed per frame (spec D4)
-    # Batching (spec D9): chosen at the speed plateau, not to fill memory.
+    max_posed: int = 3             # K: people posed per frame
+    # Batching: chosen at the speed plateau, not to fill memory.
     det_batch: int = 64            # frames per detector call
     pose_batch: int = 128          # crops per pose call; the call also carries their 128 mirrors
     chunk_bytes: int = 512 << 20   # decode chunk budget: originals + 640x640 letterboxes
@@ -69,8 +64,7 @@ class Settings:
     det_profile: Tuple[int, int, int] = (1, 64, 64)
     pose_profile: Tuple[int, int, int] = (1, 256, 256)
     repo_root: Path = REPO_ROOT          # the source checkout: git sha in the provenance
-    # None (only in Settings pickled by older code): <repo_root>/models, as that code used.
-    models_root: Optional[Path] = None
+    models_root: Optional[Path] = None   # None: paths.models_dir() (resolved in __post_init__)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, 'models_root', paths.models_dir(self.models_root))
@@ -87,10 +81,6 @@ class Settings:
         if not (self.pose_profile[0] <= 2 * self.pose_batch <= self.pose_profile[2]):
             raise ValueError('2 * pose_batch (crops + mirrors) must lie inside pose_profile')
 
-    def replace(self, **changes) -> 'Settings':
-        """Return a copy with `changes` applied (validated again)."""
-        return dataclasses.replace(self, **changes)
-
     @property
     def profile(self) -> PrecisionProfile:
         return PRECISION_PROFILES[self.precision]
@@ -102,7 +92,7 @@ class Settings:
     # ------------------------------------------------------------------ paths
     @property
     def models_dir(self) -> Path:
-        return self.repo_root / 'models' if self.models_root is None else Path(self.models_root)
+        return Path(self.models_root)
 
     @property
     def det_config(self) -> Path:

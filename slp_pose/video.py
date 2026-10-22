@@ -1,4 +1,4 @@
-"""Video probing (ffprobe) and the threaded chunk reader (spec §4.3 step 1).
+"""Video probing (ffprobe) and the threaded chunk reader.
 
 The reader decodes every frame with cv2's FFmpeg backend (BGR, native fps, no cropping),
 letterboxes each frame on the CPU into a pinned buffer and hands out `Chunk`s. One background
@@ -67,32 +67,6 @@ def chunk_frames(width: int, height: int, settings: Settings) -> int:
     return n
 
 
-def read_frames(path: Path, start: int, count: int) -> np.ndarray:
-    """(n,H,W,3) uint8 BGR frames start..start+count-1, n <= count at the end of the video.
-
-    Frame-exact: decodes sequentially from frame 0 (cv2 seeking is not frame-exact for every
-    codec), so it costs O(start) decoding.
-    """
-    cap = cv2.VideoCapture(str(path), cv2.CAP_FFMPEG)
-    if not cap.isOpened():
-        raise VideoError(f'cv2 cannot open {path}')
-    empty = np.zeros((0, int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)), int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), 3),
-                     np.uint8)
-    frames = []
-    try:
-        for _ in range(start):
-            if not cap.grab():
-                return empty
-        for _ in range(count):
-            ok, frame = cap.read()
-            if not ok:
-                break
-            frames.append(frame)
-    finally:
-        cap.release()
-    return np.stack(frames) if frames else empty
-
-
 def chunk_from_frames(video: VideoInfo, start: int, frames: np.ndarray, last: bool = True) -> Chunk:
     """A standalone (non-pooled) Chunk for already-decoded frames, e.g. parity windows and tests."""
     geom = letterbox_geometry(video.width, video.height)
@@ -125,9 +99,9 @@ class ChunkReader:
     """Iterate `Chunk`s of `videos` in order, decoded by a background thread.
 
     Every yielded chunk must be `release()`d once its buffers are no longer needed; the reader
-    blocks when all slots are held. Frame-count rule (spec §4.4): the decoded frame count must equal
+    blocks when all slots are held. Frame-count rule: the decoded frame count must equal
     ffprobe nb_frames, or the dataset's expected_frames when it sets one (VideoInfo.frame_count:
-    a source truncated in its official archive, D28; just as strict), otherwise the video ends with
+    a source truncated in its official archive; just as strict), otherwise the video ends with
     an error chunk, unless `allow_frame_mismatch` (then every decodable frame is read and T is
     whatever was decoded).
     Use as a context manager, or call `close()`, to stop the thread early.

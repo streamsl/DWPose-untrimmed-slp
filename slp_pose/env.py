@@ -1,4 +1,4 @@
-"""Start-up checks and process setup (spec §4.2 env.py).
+"""Start-up checks and process setup.
 
 `configure_process()` must run before CUDA is initialised; `python -m slp_pose` does it first.
 """
@@ -13,8 +13,8 @@ from typing import Dict, List, Optional, Tuple
 from .paths import REPO_ROOT
 
 _COMMON_PINS = {'torch': '2.1.2', 'mmcv': '2.1.0', 'mmdet': '3.3.0', 'mmpose': '1.3.2'}
-# TensorRT of each locked environment: requirements-py38.txt (the BOBSL machine, engines built and
-# parity-gated with 10.13.3.9) and requirements.txt (Python 3.11, the newest TensorRT 10). Engines
+# TensorRT of each locked environment: requirements-py38.txt (Python 3.8, the environment the built-in
+# datasets were extracted and parity-gated with) and requirements.txt (Python 3.11). Engines
 # are rebuilt per machine and their sha256 is in the extraction hash, so outputs of different
 # TensorRT versions never pass for each other on resume.
 TENSORRT_VERSIONS = {(3, 8): '10.13.3.9', (3, 11): '10.16.1.11'}
@@ -82,7 +82,8 @@ def environment_problems(need_trt: bool, repo_root: Path = REPO_ROOT) -> List[st
     local = Path(repo_root) / 'mmpose' / 'mmpose'
     got = Path(mmpose.__file__ or '').resolve().parent
     if local.is_dir() and got != local.resolve():
-        problems.append(f'mmpose imported from {got}, expected {local.resolve()} (check .venv easy-install.pth)')
+        problems.append(f'mmpose imported from {got}, expected {local.resolve()} (check the venv\'s .pth files: '
+                        f'scripts/setup_env.sh writes slp_pose_mmpose_source.pth)')
     versions = library_versions(include_trt=need_trt)
     for name, want in PINNED_VERSIONS.items():
         if name == 'tensorrt' and not need_trt:

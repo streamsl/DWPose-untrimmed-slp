@@ -1,21 +1,21 @@
-"""video_meta rows and the CSV writer (spec §4.1 `video_meta.csv`, D18, D19, D23).
+"""video_meta rows and the CSV writer.
 
 CPU only, no torch.
 
 The CSV is misaligned-slt's poses/pose_io.py contract: header META_FIELDS, bytes equal to its
-`save_video_meta`. The current meta row (provenance meta_version == META_VERSION, written by
-`record.derive`) is a plain dict with exactly the keys of META_FIELDS, in that order:
+`save_video_meta`. A meta row is a plain dict with exactly the keys of META_FIELDS, in that order:
   video_id str; duration_s float = T * den / num (exact rational fps); width int; height int
-  (original frame size); caption_source None (blank until the subtitles design);
+  (original frame size); caption_source None (run.merge_meta fills it from .state/captions.json
+  once `slp-pose subs` has run);
   undetected_ratio float = share of frames with nobody in the count set (num_persons == 0, the
   whole frame; misaligned-slt's audit value, no rule reads it);
   masked_runs, empty_runs, handless_runs: lists of [a, b] (Python ints), half-open frame runs on
   the poses/ grid, ascending and disjoint; [] = measured, no run.
 The three run kinds are misaligned-slt prepare_yt25.py's masked_runs / empty_runs /
-handless_runs at commit MSLT_COMMIT, with the same algorithm and constants, applied to our record
-(D19, D23). The constants are seconds, as there; each video converts them to frames of its poses/
-grid with seconds_to_frames at the rate misaligned-slt's loader reads for it, T / duration_s
-(loader_fps; 0.5 / 1 / 2 s = 13 / 25 / 50 frames at 25 fps, 15 / 30 / 60 at 29.97 fps):
+handless_runs at commit MSLT_COMMIT, with the same algorithm and constants, applied to our record.
+The constants are seconds, as there; each video converts them to frames of its poses/ grid with
+seconds_to_frames at the rate misaligned-slt's loader reads for it, T / duration_s (loader_fps;
+0.5 / 1 / 2 s = 13 / 25 / 50 frames at 25 fps, 15 / 30 / 60 at 29.97 fps):
   the kept body = the primary (the poses/ row, kpt_primary; none where it is -1);
   a person = a posed row; its body = COCO joints 0-16 plus a neck (the shoulders' midpoint,
     visible when both shoulders are), the OpenPose-18 body of upstream DWPose; a joint is visible
@@ -25,17 +25,14 @@ grid with seconds_to_frames at the rate misaligned-slt's loader reads for it, T 
     motion of the real candidates other than the kept body (in the kept body's shoulder widths),
     each followed as a person across the frames (by its shoulder midpoint, not its detector slot);
     the candidates are every posed row for a per-frame primary rule, and for a video-level rule
-    (signer.SignerChoice.region, D18) the posed rows whose box centre lies in the frame's
+    (signer.SignerChoice.region) the posed rows whose box centre lies in the frame's
     interpreter region, plus the primary (see people_in_region);
   empty_runs: frames whose kept body is not a real body (no primary, or too few visible joints);
   handless_runs: frames whose poses/ row shows no hand.
-Legacy rows (LEGACY_META_FIELDS) are what the GPU workers' SpillWriter.finalize still commits
-(meta_version absent; the respawned workers of a running extraction import this code, so their
-output must not change) and what `derive` wrote before D19 (meta_version None or
-REGION_META_VERSION); `derive` replaces them. The CSV writes such a row with blank run cells
-(unknown to misaligned-slt).
-The row is stored as JSON (json.dumps(allow_nan=True), NaN token) in `<root>/.state/meta/<vid>.json`
-and in the `meta` member of persons/<vid>.npz.
+A GPU worker's commit holds the whole-frame row of its per-frame extraction rule; the parent's
+`derive` replaces it with the row of the dataset's primary rule. The row is stored as JSON
+(json.dumps(allow_nan=True), NaN token) in `<root>/.state/meta/<vid>.json` and in the `meta` member
+of persons/<vid>.npz.
 """
 from __future__ import annotations
 
@@ -49,27 +46,19 @@ from typing import Dict, List, Mapping, Optional, Tuple
 
 import numpy as np
 
-from .types import COUNT_SET
-
 # Byte-for-byte misaligned-slt poses/pose_io.py::META_FIELDS (RUN_FIELDS last).
 RUN_FIELDS = ('masked_runs', 'empty_runs', 'handless_runs')
 META_FIELDS = ('video_id', 'duration_s', 'width', 'height', 'caption_source', 'undetected_ratio') + RUN_FIELDS
-# Version of the meta definitions, stored as provenance['meta_version'] by `derive` and hashed into
-# every rule's derivation_hash (record.py): absent = LEGACY_META_FIELDS whole frame (what finalize
-# writes), REGION_META_VERSION = LEGACY_META_FIELDS in the interpreter region (D18), META_VERSION =
-# META_FIELDS (D19); 4 = D19 with misaligned-slt 6c72fbd's masked_runs: a real body other than the
-# kept one counts as an extra body only when an elbow or wrist is visible (D20); 5 = misaligned-slt
-# 3eb85af's: the run constants in seconds at each video's fps, arm motion per person track (D23).
-# Bump META_VERSION whenever a definition below changes.
+# Version of the meta definitions: stored as provenance['meta_version'] by `derive` and hashed into
+# every rule's derivation_hash (record.py); a GPU worker's commit has none. Bump META_VERSION whenever a
+# definition below changes.
 META_VERSION = 5
-REGION_META_VERSION = 2
-# The misaligned-slt commit whose prepare_yt25.py run definitions this module follows (D23); `derive`
-# stores it as provenance['mslt_commit'].
+# The misaligned-slt commit whose prepare_yt25.py run definitions this module follows; `derive` stores
+# it as provenance['mslt_commit'].
 MSLT_COMMIT = '3eb85af'
 JOINT_SCORE_THR = 0.3          # a joint is visible / valid only when its raw score > this (float32 compare)
 # misaligned-slt prepare_yt25.py constants (times in seconds, as there; seconds_to_frames converts
-# them per video) and configs/data.yaml poses.min_extra_person_motion; tests/test_meta_runs.py checks
-# them against the checkout.
+# them per video) and configs/data.yaml poses.min_extra_person_motion.
 REAL_BODY_JOINTS = 8           # _REAL_BODY_JOINTS: visible body joints (of 18) of a real body
 COORD_TOLERANCE = 0.25         # _COORD_TOLERANCE: x/W or y/H outside [-tol, 1 + tol] is off screen
 MASK_RUN_S = 0.5               # _MASK_RUN_S: runs closer than this merge; shorter masked runs drop
@@ -94,11 +83,11 @@ _BLOCK_ROWS = 16384            # posed rows read from kpts at a time
 Runs = List[List[int]]
 
 
-# --------------------------------------------------------------------------- current row (D19)
+# --------------------------------------------------------------------------- meta row
 def meta_row(video_id: str, frame_size: Tuple[int, int], fps: Tuple[int, int], num_persons: np.ndarray,
              kpt_offsets: np.ndarray, kpts: np.ndarray, kpt_primary: np.ndarray,
              candidates: Optional[np.ndarray] = None) -> Dict[str, object]:
-    """The current meta row of one video (module docstring); T = len(num_persons) must be > 0.
+    """The meta row of one video (module docstring); T = len(num_persons) must be > 0.
 
     frame_size = (W, H), fps = (num, den), num_persons (T,) uint8 count-set sizes; kpt_offsets,
     kpts (may be a memmap, read in blocks) and kpt_primary as in the persons record. `candidates`:
@@ -113,11 +102,13 @@ def meta_row(video_id: str, frame_size: Tuple[int, int], fps: Tuple[int, int], n
         raise ValueError(f'{video_id}: kpt_offsets / kpt_primary do not cover {t} frames')
     real, hand = _kept_body(kpt_offsets, kpts, kpt_primary)
     rate = loader_fps(t, fps)
+    handless_run = seconds_to_frames(HANDLESS_RUN_S, rate)
     return dict(video_id=str(video_id), duration_s=duration_s(t, fps[0], fps[1]),
                 width=int(frame_size[0]), height=int(frame_size[1]), caption_source=None,
                 undetected_ratio=int(np.count_nonzero(num_persons == 0)) / t,
                 masked_runs=masked_runs(kpt_offsets, kpts, kpt_primary, rate, frame_size, candidates),
-                empty_runs=empty_runs(~real, rate), handless_runs=_runs(~hand, seconds_to_frames(HANDLESS_RUN_S, rate)))
+                empty_runs=empty_runs(~real, rate),
+                handless_runs=[[a, b] for a, b in _edges(~hand) if b - a >= handless_run])
 
 
 def seconds_to_frames(seconds: float, fps: float) -> int:
@@ -215,26 +206,9 @@ def empty_runs(empty: np.ndarray, fps: float) -> Runs:
     return [run for run in runs if run[1] - run[0] >= empty_run]
 
 
-def handless_runs(poses: np.ndarray, fps: float) -> Runs:
-    """Port of misaligned-slt prepare_yt25.handless_runs on a (T,133,3) poses array: runs of at least
-    HANDLESS_RUN_S (in frames at `fps`) in which neither hand has HAND_MIN_POINTS keypoints scoring
-    > HAND_CONF (a zero row has no hand); never merged."""
-    poses = np.asarray(poses)
-    hand = _hands(poses[:, COCO_HANDS[0], 2], poses[:, COCO_HANDS[1], 2])
-    return _runs(~hand, seconds_to_frames(HANDLESS_RUN_S, fps))
-
-
-def _hands(left: np.ndarray, right: np.ndarray) -> np.ndarray:
-    return ((left > HAND_CONF).sum(axis=1) >= HAND_MIN_POINTS) | ((right > HAND_CONF).sum(axis=1) >= HAND_MIN_POINTS)
-
-
 def _edges(mask: np.ndarray) -> List[Tuple[int, int]]:
     edges = np.flatnonzero(np.diff(np.concatenate([[0], mask.astype(np.int8), [0]])))
     return list(zip(edges[::2].tolist(), edges[1::2].tolist()))
-
-
-def _runs(mask: np.ndarray, min_length: int) -> Runs:
-    return [[a, b] for a, b in _edges(mask) if b - a >= min_length]
 
 
 def _kept_body(kpt_offsets: np.ndarray, kpts: np.ndarray, kpt_primary: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -245,8 +219,10 @@ def _kept_body(kpt_offsets: np.ndarray, kpts: np.ndarray, kpt_primary: np.ndarra
     real, hand = np.zeros(len(primary), bool), np.zeros(len(primary), bool)
     for s in range(0, len(rows), _BLOCK_ROWS):
         block = np.asarray(kpts[rows[s:s + _BLOCK_ROWS, None], _KEPT_COLUMNS])   # (n, 17 + 42, 3)
+        left, right = block[:, COCO_BODY:COCO_BODY + 21, 2], block[:, COCO_BODY + 21:, 2]
         real[frames[s:s + _BLOCK_ROWS]] = real_bodies(block)
-        hand[frames[s:s + _BLOCK_ROWS]] = _hands(block[:, COCO_BODY:COCO_BODY + 21, 2], block[:, COCO_BODY + 21:, 2])
+        hand[frames[s:s + _BLOCK_ROWS]] = (((left > HAND_CONF).sum(axis=1) >= HAND_MIN_POINTS)
+                                           | ((right > HAND_CONF).sum(axis=1) >= HAND_MIN_POINTS))
     return real, hand
 
 
@@ -340,7 +316,7 @@ def _person_tracks(frame: np.ndarray, centre: np.ndarray) -> np.ndarray:
     the rows in frame order, then slot order. A row joins the nearest person whose last centre is
     within SLOT_JUMP and whom no earlier row of its frame joined (ties: the earlier person), else it
     starts a new person; a person never expires. Detector slots re-order every frame, so pooling by
-    slot made two still people who swap ranks look like one moving person."""
+    slot would make two still people who swap ranks look like one moving person."""
     person = np.empty(len(frame), np.int64)
     last = np.empty((len(frame), 2))   # each person's last centre
     taken = np.zeros(len(frame), bool)
@@ -361,23 +337,15 @@ def _person_tracks(frame: np.ndarray, centre: np.ndarray) -> np.ndarray:
     return person
 
 
-@dataclass(frozen=True)
-class RegionPeople:
-    """The people inside the interpreter's region of a video (people_in_region)."""
-
-    count: np.ndarray   # (T,) int64 COUNT_SET people inside the frame's region, 0 without a region
-    posed: np.ndarray   # (M,) bool: posed row (kpts order) inside its frame's region
-
-
-def people_in_region(region: np.ndarray, det_offsets: np.ndarray, det_boxes: np.ndarray, det_flags: np.ndarray,
-                     kpt_det: np.ndarray) -> RegionPeople:
-    """Who is inside the region: a person is inside when the centre of their box,
+def people_in_region(region: np.ndarray, det_offsets: np.ndarray, det_boxes: np.ndarray,
+                     kpt_det: np.ndarray) -> np.ndarray:
+    """(M,) bool: the posed rows (kpts order) inside their frame's interpreter region, masked_runs'
+    candidates for a video-level rule. A person is inside when the centre of their box,
     ((x1 + x2) / 2, (y1 + y2) / 2) in float64, lies in the region box, edges included.
-    `posed` are masked_runs' candidates for a video-level rule; `count` is the legacy D18 count.
 
     Args:
         region: (T,4) xyxy original pixels per frame, NaN rows = no region (signer.SignerChoice.region).
-        det_offsets, det_boxes, det_flags: the record's candidates (det_flags COUNT_SET bits as committed).
+        det_offsets, det_boxes: the record's candidates.
         kpt_det: (M,) video-global det row of each posed row.
     """
     region = np.asarray(region, np.float64)
@@ -391,133 +359,12 @@ def people_in_region(region: np.ndarray, det_offsets: np.ndarray, det_boxes: np.
     cx, cy = (boxes[:, 0] + boxes[:, 2]) / 2, (boxes[:, 1] + boxes[:, 3]) / 2
     inside = np.zeros(int(offsets[-1]), bool)
     inside[rows] = (cx >= box[:, 0]) & (cx <= box[:, 2]) & (cy >= box[:, 1]) & (cy <= box[:, 3])
-    counted = inside & ((np.asarray(det_flags) & COUNT_SET) != 0)
-    return RegionPeople(count=np.bincount(frame[counted], minlength=num_frames).astype(np.int64),
-                        posed=inside[np.asarray(kpt_det, np.int64)])
+    return inside[np.asarray(kpt_det, np.int64)]
 
 
 def duration_s(num_frames: int, fps_num: int, fps_den: int) -> float:
     """T * den / num as a Python float (written with repr)."""
     return int(num_frames) * int(fps_den) / int(fps_num)
-
-
-# --------------------------------------------------------------------------- legacy rows (finalize, D18)
-# The person columns misaligned-slt read before 2026-10-01 (poses/signverse.py, since removed there).
-# Kept only while the running BOBSL workers commit legacy rows; after that run, finalize writes the
-# current row and this section goes (design doc §5, 'Legacy meta code').
-LEGACY_META_FIELDS = ('video_id', 'duration_s', 'width', 'height', 'caption_source',
-                      'multi_person_ratio', 'undetected_ratio', 'extra_person_motion')
-
-
-def legacy_meta_row(video_id: str, frame_size: Tuple[int, int], fps: Tuple[int, int], num_persons: np.ndarray,
-                    kpt_offsets: np.ndarray, kpts: np.ndarray, kpt_primary: np.ndarray,
-                    people: Optional[RegionPeople] = None) -> Dict[str, object]:
-    """The legacy row (LEGACY_META_FIELDS) that SpillWriter.finalize commits, unchanged since the
-    BOBSL production run started; T = len(num_persons) must be > 0. Types: multi_person_ratio,
-    undetected_ratio, extra_person_motion float (NaN when the statistic is None). `people` None:
-    whole frame (multi = mean(num_persons >= 2), undetected = mean(num_persons == 0), motion over
-    every non-primary posed person); else the D18 interpreter-region columns (multi = share of
-    frames with >= 2 COUNT_SET people inside, undetected = mean(kpt_primary == -1), motion over the
-    non-primary posed people inside).
-    """
-    num_persons = np.asarray(num_persons)
-    t = len(num_persons)
-    if t == 0:
-        raise ValueError(f'{video_id}: a meta row needs at least one frame')
-    if len(kpt_offsets) != t + 1 or len(kpt_primary) != t:
-        raise ValueError(f'{video_id}: kpt_offsets / kpt_primary do not cover {t} frames')
-    if people is None:
-        multi, undetected = np.count_nonzero(num_persons >= 2), np.count_nonzero(num_persons == 0)
-        motion = extra_person_motion(kpt_offsets, kpts, kpt_primary)
-    else:
-        if len(people.count) != t or len(people.posed) != len(kpts):
-            raise ValueError(f'{video_id}: the region people do not cover {t} frames and {len(kpts)} posed rows')
-        multi, undetected = np.count_nonzero(people.count >= 2), np.count_nonzero(np.asarray(kpt_primary) < 0)
-        motion = extra_person_motion(kpt_offsets, kpts, kpt_primary, keep=people.posed)
-    return dict(video_id=str(video_id), duration_s=duration_s(t, fps[0], fps[1]),
-                width=int(frame_size[0]), height=int(frame_size[1]), caption_source=None,
-                multi_person_ratio=int(multi) / t, undetected_ratio=int(undetected) / t,
-                extra_person_motion=math.nan if motion is None else float(motion))
-
-
-def extra_person_motion(kpt_offsets: np.ndarray, kpts: np.ndarray, kpt_primary: np.ndarray,
-                        keep: Optional[np.ndarray] = None) -> Optional[float]:
-    """The legacy extra_person_motion (old misaligned-slt poses/signverse.py, each person scaled by
-    its OWN shoulder width; superseded there by _arm_motion, see masked_runs).
-
-    Args:
-        kpt_offsets: (T+1,) int64 CSR offsets into kpts.
-        kpts: (M,133,3) float32 saved encoding (x/W, y/H, raw score); may be a memmap (only the
-            six shoulder and arm joints of the extra rows are read).
-        kpt_primary: (T,) int8 primary position per frame, -1 = none.
-        keep: optional (M,) bool, the posed rows taking part (the primary rows always do); the
-            statistic is then computed on the record holding only those rows.
-    Slots: in frame t the non-primary posed rows, in stored order (= descending detector score),
-    are slot 1, slot 2, ... (a frame without a primary has no extra slots). Per slot the joint
-    coordinates are float64 (x/W, y/H), NaN where raw score <= JOINT_SCORE_THR; right/left
-    shoulder = COCO_SHOULDERS, arm joints = COCO_ARMS; then shoulder-width normalisation with the
-    0.5 * median floor, >= 10 observations per joint, nanstd, max over joints and slots.
-    Returns:
-        The largest per-slot arm variation; None when extra posed people exist but none is
-        measurable; 0.0 when there are no extra posed people.
-    """
-    offsets = np.asarray(kpt_offsets, np.int64)
-    kpt_primary = np.asarray(kpt_primary, np.int64)
-    rows = None
-    if keep is not None:
-        offsets, kpt_primary, rows = _kept_rows(offsets, kpt_primary, keep)
-    frame = np.repeat(np.arange(len(offsets) - 1), np.diff(offsets))
-    position = np.arange(offsets[-1]) - offsets[:-1][frame]   # position in the frame's posed list
-    primary = kpt_primary[frame]
-    extra = np.flatnonzero((primary >= 0) & (position != primary))
-    if not len(extra):
-        return 0.0
-    slot = position[extra] + (position[extra] < primary[extra])
-    joints = kpts[(extra if rows is None else rows[extra])[:, None], _SLOT_JOINTS]   # (n, 6, 3) float32
-    xy = joints[..., :2].astype(np.float64)
-    # Compared in float32, like every numpy consumer of the saved scores: float32(0.3) is invalid.
-    xy[~(joints[..., 2] > JOINT_SCORE_THR)] = np.nan
-    motions = [m for m in (_slot_motion(xy[slot == s]) for s in np.unique(slot)) if m is not None]
-    return max(motions) if motions else None
-
-
-def _kept_rows(offsets: np.ndarray, primary: np.ndarray, keep: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """The record reduced to the `keep` rows plus every primary row: (its kpt_offsets, its
-    kpt_primary, the original row of each of its rows)."""
-    keep = np.array(keep, bool)
-    if keep.shape != (offsets[-1],):
-        raise ValueError(f'keep has shape {keep.shape}, expected ({offsets[-1]},)')
-    has = primary >= 0
-    primary_row = offsets[:-1][has] + primary[has]
-    keep[primary_row] = True
-    frame = np.repeat(np.arange(len(primary)), np.diff(offsets))
-    new_offsets = np.concatenate([[0], np.cumsum(np.bincount(frame[keep], minlength=len(primary)))]).astype(np.int64)
-    new_primary = np.full(len(primary), -1, np.int64)
-    new_primary[has] = (np.cumsum(keep) - 1)[primary_row] - new_offsets[:-1][has]
-    return new_offsets, new_primary, np.flatnonzero(keep)
-
-
-def _slot_motion(xy: np.ndarray) -> Optional[float]:
-    """The legacy per-slot computation, vectorised over the slot's frames.
-
-    xy: (n, 6, 2) float64 in frame order: right shoulder, left shoulder, then COCO_ARMS. Each frame
-    is scaled by this slot's own shoulder width, floored at half its median width.
-    """
-    right, left = xy[:, 0], xy[:, 1]
-    finite = np.flatnonzero(np.isfinite(right).all(axis=-1) & np.isfinite(left).all(axis=-1))
-    width = np.linalg.norm(right[finite] - left[finite], axis=-1)
-    wide = width > _MIN_SHOULDER_WIDTH
-    rows, width = finite[wide], width[wide]
-    if not len(rows):
-        return None
-    arms = xy[rows, 2:] - ((right[rows] + left[rows]) / 2.0)[:, None, :]
-    arms = arms / np.maximum(width, 0.5 * float(np.median(width)))[:, None, None]
-    seen = np.isfinite(arms).all(axis=-1)
-    keep = seen.sum(axis=0) >= _MIN_OBSERVATIONS
-    if not keep.any():
-        return None
-    sd = np.nanstd(np.where(seen[..., None], arms, np.nan)[:, keep], axis=0)
-    return float(np.nanmax(sd))
 
 
 # --------------------------------------------------------------------------- CSV
@@ -529,17 +376,12 @@ def _cell(value: object) -> str:
 def csv_cells(row: Mapping[str, object]) -> List[str]:
     """The 9 CSV cells of a row, formatted exactly like misaligned-slt `save_video_meta`:
     duration_s via str(float) (== repr), width/height as int ('' if None), caption_source '' if
-    None, undetected_ratio f'{x:.4f}', each run column json.dumps(list) ('' if None or absent, as
-    in a legacy row: unknown).
+    None, undetected_ratio f'{x:.4f}', each run column json.dumps(list).
     """
-    def runs(key: str) -> str:
-        value = row.get(key)
-        return '' if value is None else json.dumps(value)
-
     ratio = row.get('undetected_ratio')
     return [str(row['video_id']), _cell(row.get('duration_s')), _cell(row.get('width')), _cell(row.get('height')),
             str(row.get('caption_source') or ''), '' if ratio is None else f'{float(ratio):.4f}',
-            *(runs(key) for key in RUN_FIELDS)]
+            *(json.dumps(row[key]) for key in RUN_FIELDS)]
 
 
 def write_video_meta(path: Path, rows: Mapping[str, Mapping[str, object]]) -> None:

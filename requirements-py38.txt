@@ -1,14 +1,9 @@
-# Exact, hash-checked environment of slp_pose for Python 3.8 on Linux x86_64: the versions of the BOBSL
-# production venv (.venv on the BOBSL machine, RTX 3090 Ti, since 2026-09-30), minus what slp_pose never
-# needs (torchaudio, the lint/test extras of mmpose, stray nvidia-* wheels nothing requires). Kept by hand.
-# The newest stack, for Python 3.11, is requirements.txt.
+# Exact, hash-checked environment of slp_pose for Python 3.8 on Linux x86_64: the one the built-in
+# datasets were extracted with (2x RTX 3090 Ti). Kept by hand; the newest stack, for Python 3.11, is
+# requirements.txt.
 #   scripts/setup_env.sh --python 3.8      installs this file
-# Differences from that .venv: it imports mmpose from the editable ./mmpose source tree (byte-identical to
-# this mmpose 1.3.2 wheel) and gets `import tensorrt` from a two-line local shim instead of the official
-# tensorrt-cu12 package pinned here (whose tensorrt/__init__.py holds the same two re-exports).
-# --no-build-isolation: the two sdists (chumpy, tensorrt-cu12) are built with the
-# pinned setuptools; chumpy's setup.py also imports pip. (chumpy is required by mmpose's metadata only:
-# mmpose never imports it, and it does not import with numpy >= 1.24.)
+# --no-build-isolation: the two sdists (chumpy, tensorrt-cu12) are built with the pinned setuptools;
+# chumpy's setup.py imports pip (mmpose lists chumpy but never imports it).
 --extra-index-url https://download.pytorch.org/whl/cu121
 --extra-index-url https://pypi.nvidia.com
 --find-links https://download.openmmlab.com/mmcv/dist/cu121/torch2.1/index.html
@@ -23,8 +18,8 @@ torch==2.1.2+cu121 --hash=sha256:daa179bb558f78f2165db974a6744ec8de2ea71eb6aaf36
 torchvision==0.16.2+cu121 --hash=sha256:0266727d089f512aa900aead2908530f54d9077784bde1e7ca46f66b8f567e98
 triton==2.1.0 --hash=sha256:39f6fb6bdccb3e98f3152e3fbea724f1aeae7d749412bbb1fa9c441d474eba26
 
-# OpenMMLab. mmcv's prebuilt CUDA ops stop at sm_86; on newer GPUs slp_pose uses its own exact NMS (D27): no rebuild.
-# mmpose is the PyPI wheel: its code is byte-identical to the v1.3.2 source tree of the BOBSL machine.
+# OpenMMLab. mmcv's prebuilt CUDA ops stop at sm_86; on newer GPUs slp_pose runs the detector NMS in torch
+# (detpost.head_nms), so mmcv needs no rebuild. mmpose 1.3.2 from PyPI.
 mmcv==2.1.0 --hash=sha256:3772a8f69102535ba8a23e09c40118fb33e936a81d42bdf6d2a10953ca187cbe
 mmdet==3.3.0 --hash=sha256:2e23e291281ac57e7dccf8678e957da45fbe560ce78a1f5ded6afeccd3730f17
 mmengine==0.10.7 --hash=sha256:262ac976a925562f78cd5fd14dd1bc9b680ed0aa81f0d85b723ef782f99c54ee

@@ -1,4 +1,4 @@
-"""Models, ONNX export, TensorRT build and the inference engines (spec §4.2 engines.py, D7).
+"""Models, ONNX export, TensorRT build and the inference engines.
 
 This is the only module that builds mmdet / mmpose models. Both backends share one interface:
 - detector engine: x (B,3,640,640) float32 CUDA, BGR 0..255 letterbox (no normalisation)
@@ -27,6 +27,7 @@ import torch
 from torch import nn
 
 from .env import is_strict_fp32, library_versions, strict_fp32
+from .record import atomic_write_text
 from .settings import Settings
 
 DET_OUTPUTS = tuple(f'{kind}_s{stride}' for kind in ('cls', 'box', 'obj') for stride in (8, 16, 32))
@@ -302,7 +303,7 @@ def _sidecar(path: Path) -> Path:
 def write_sha256_sidecar(path: Path) -> str:
     """Write `<path>.sha256` in sha256sum format and return the digest."""
     digest = sha256_file(path)
-    _atomic_write_text(_sidecar(path), f'{digest}  {path.name}\n')
+    atomic_write_text(_sidecar(path), f'{digest}  {path.name}\n')
     return digest
 
 
@@ -316,12 +317,6 @@ def verified_sha256(path: Path) -> str:
     if got != want:
         raise RuntimeError(f'{path} sha256 {got} does not match its sidecar {want}')
     return got
-
-
-def _atomic_write_text(path: Path, text: str) -> None:
-    tmp = path.with_name(path.name + '.tmp')
-    tmp.write_text(text)
-    os.replace(tmp, path)
 
 
 def onnx_path(settings: Settings, key: str) -> Path:
@@ -420,7 +415,7 @@ def build_trt_engine(settings: Settings, key: str, device: torch.device, force: 
                   gpu=torch.cuda.get_device_name(device),
                   compute_capability='%d.%d' % torch.cuda.get_device_capability(device),
                   build_seconds=round(time.time() - t0, 1), libraries=library_versions())
-    _atomic_write_text(out.with_name(out.name + '.json'), json.dumps(record, indent=1, sort_keys=True) + '\n')
+    atomic_write_text(out.with_name(out.name + '.json'), json.dumps(record, indent=1, sort_keys=True) + '\n')
     write_sha256_sidecar(out)
     return out
 

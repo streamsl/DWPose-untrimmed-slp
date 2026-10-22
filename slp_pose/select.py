@@ -1,5 +1,4 @@
-"""Posed-slot selection and the framework's per-frame primary-signer rules (spec §4.2 select.py,
-assumption 4, D4, D14, D22).
+"""Posed-slot selection and the framework's per-frame primary-signer rules.
 
 Pure numpy on the CPU; must not import torch.
 
@@ -17,8 +16,8 @@ Frames with an empty pose set have no posed rows and primary -1.
 A per-frame rule is a FrameRule: a name and pick(boxes (n,4) float32 xyxy px, scores (n,) float32,
 frame_size (W, H) or None) -> index in 0..n-1 (n >= 1); only rules that look at positions need
 frame_size. The framework's rules (PRIMARY_RULES) are generic; a rule for one dataset only (e.g.
-Auslan News' `right_largest`) is defined in that dataset's file and listed in its Dataset.rules
-(D22). Functions here take a FrameRule or the name of a framework rule.
+Auslan News' `right_largest`) is defined in that dataset's file and listed in its Dataset.rules.
+Functions here take a FrameRule or the name of a framework rule.
 """
 from __future__ import annotations
 

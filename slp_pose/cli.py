@@ -1,55 +1,13 @@
-"""Command line: `slp-pose <command>` or `python -m slp_pose <command>` (spec §4.2 cli.py).
+"""Command line: `slp-pose <command>` or `python -m slp_pose <command>`; `slp-pose <command> --help`
+lists each command's options.
 
 Argument parsing imports no torch: each command imports what it needs, and the GPU commands set
 CUDA_VISIBLE_DEVICES before torch is imported. Dataset commands take --dataset NAME_OR_FILE (a
 registered or installed dataset, or a dataset .py file: slp_pose.datasets) and --data-root
 (paths.data_root); every command takes --models-dir (paths.models_dir). Output roots default to
 the dataset's out_root(). Commands with an output directory log to stdout and to
-<out root>/.state/logs/<command>_<time>.log.
+<out root>/.state/logs/<command>_<time>.log (render-done to its visualization directory).
 
-Commands and options (argparse; defaults in brackets):
-  fetch-models   --from PATH... --no-download
-                 fetch.fetch_models into the models directory (both downloaded, or copied from --from).
-  build-engines  --gpu N [0] --force
-                 engines.build_engines(Settings(), cuda:0, force) on GPU N; prints engines.engine_summary.
-  list-videos    --dataset --data-root --list
-                 datasets.load_videos: checks the dataset's contract, prints counts (and every video).
-  parity         --dataset [bobsl] --videos N [20] --windows N [3] --window-s S [30]
-                 --full-videos N [2] --seed N [0] --gpu N [0] --out DIR [<out_root>_dev/parity]
-                 --backend trt|torch [trt] --jitter batched_det tf32 (batched_det sets the jitter-relative limits, D17);
-                 parity.run_parity writes the report JSON,
-                 exit code 0 iff parity.gate passes.
-  extract        --dataset [bobsl] --out-root PATH [dataset.out_root()] --gpus 0,1 [0,1]
-                 --videos ID... --limit N --backend trt|torch [trt] --allow-frame-mismatch
-                 -> run.run_extract (workers use the dataset's extraction rule, the parent derives
-                 its primary rule); exit code 0 iff every video was extracted or already done.
-  derive         --dataset --out-root --videos ID... [all committed] --primary-rule R [dataset rule;
-                 per-frame or video-level, the framework's or the dataset's own: Dataset.rule]
-                 -> record.derive per video (the current meta row, D19), then run.merge_meta (run.run_derive).
-  check          --dataset --out-root --videos ID... [all committed] --no-crc
-                 -> record.check per video (rules resolved by the dataset; the CRC-32 of every persons/
-                 member unless --no-crc; failed reads retried, D28), plus record.derivation_problems
-                 (outputs not derived with the dataset's primary rule, count settings and current meta definitions)
-                 and the decoder errors of the video's committed decode (decodelog.is_decoder_line lines of
-                 decodelog.printed_lines, D28; logged only, for a source the dataset declares damaged:
-                 Video.known_damage; the worker's other stderr lines are logged as info);
-                 prints problems and render commands for the suggested windows; exit code 1 on problems.
-  render         VIDEO_ID --dataset --out-root --start-s S [0] --duration-s S [30] | --full --persons
-                 --out PATH [<out-root>/renders/<vid>_<start frame>.mp4, <vid>_full.mp4 with --full]
-                 -> render.render_video.
-  render-done    --dataset --out-root --vis-dir DIR [<out-root>_vis] --jobs N [3] --videos ID...
-                 --limit N --follow --poll-s S [300] --no-persons
-                 -> render_batch.render_committed (read-only on the output root; logs in <vis-dir>;
-                 one run per vis dir); exit code 0 iff no video failed or was left unchecked mid-commit.
-  subs           --dataset --out-root
-                 -> run.write_video_index (video_ids.csv with the dataset's current splits), subs.write_subs
-                 (the dataset's Dataset.captions -> <out-root>/subs/<vid>.<track>.vtt, .state/captions.json),
-                 then run.merge_meta (video_meta.csv caption_source), under the root lock (not while extract
-                 or derive runs on that root), D30.
-  splits         --dataset --out-root
-                 -> subs.write_splits: the dataset's own split files in <out-root>: splits.csv, or one
-                 splits_<name>.csv per split it declares (BOBSL: splits_automatic.csv, splits_manual.csv),
-                 each a CSV video_id,split for misaligned-slt's splits.signverse_csv ('val' = dev), D32.
 Exit codes: 0 success; 1 failure (failed videos, check problems, parity gate, missing models);
 2 bad arguments (incl. an unknown or invalid dataset); 130 interrupted.
 """
@@ -334,7 +292,7 @@ def _render(args: argparse.Namespace) -> int:
         count = round(args.duration_s * video.fps_num / video.fps_den)
         name = f'{video.video_id}_{start}.mp4'
     out = args.out or root / 'renders' / name
-    from .render_batch import sigterm_as_interrupt
+    from .run import sigterm_as_interrupt
     with sigterm_as_interrupt():   # a killed render removes its .part file and stops its ffmpeg
         log.info('wrote %s', render_video(root, video, out, start, count, persons=args.persons))
     return 0

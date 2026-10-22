@@ -1,4 +1,4 @@
-"""Full-length overlay videos of every committed video (spec §4.5, the `render-done` command).
+"""Full-length overlay videos of every committed video (the `render-done` command).
 
 Read-only with respect to the output root: it lists .state/done/, reads poses/ and persons/ of
 committed videos, and probes the lock without creating it, so it can run beside a live extraction.
@@ -20,35 +20,28 @@ these options and mp4 but whose files the done marker does not describe at that 
 progress, or cut short) is neither rendered nor up to date: it is looked at again at the next pass
 (summary.pending). A render whose inputs changed meanwhile, or whose files the done marker did not
 describe (a commit in progress), is discarded.
-A version-1 record ({marker, persons, mp4}: rendered from the commit of that done marker, written
-by render-done before RECORD_VERSION) is upgraded while its marker is unchanged, so run the new
-render-done (`--limit 0` renders nothing) before a re-commit; a render task from a still-running
-older render-done (no record_version) keeps its version-1 behaviour.
 One render-done at a time per visualization directory: it holds <vis_dir>/.state/lock.
 Importing this module does not import torch or cv2; only the render processes do.
 """
 from __future__ import annotations
 
-import contextlib
-import errno
 import json
 import logging
 import multiprocessing
 import os
 import signal
 import sys
-import threading
 import time
 import zipfile
 from dataclasses import dataclass, field
 from multiprocessing import connection as mp_connection
 from pathlib import Path
-from typing import Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 import numpy as np
 
-from .record import OutputLayout
-from .run import committed_videos, root_lock
+from .record import OutputLayout, fsync_path
+from .run import committed_videos, root_lock, sigterm_as_interrupt
 
 log = logging.getLogger(__name__)
 
@@ -59,7 +52,7 @@ NICENESS = 10      # added to each render process's nice value
 _JOIN_S = 30.0     # how long a stopped render process may take to clean up before it is killed
 _PR_SET_PDEATHSIG = 1   # linux/prctl.h
 RECORDS = Path('.state') / 'rendered'   # under the vis dir: <vid>.json render records
-RECORD_VERSION = 2   # render records keyed on the overlay's inputs (version 1: on the done marker)
+RECORD_VERSION = 2   # the render record format (module docstring)
 # persons/ members the overlay reads (render._open_persons, render._draw_people); POSE_MEMBERS
 # determine poses/ (record invariant), the only input of a --no-persons render.
 POSE_MEMBERS = ('num_frames', 'kpt_offsets', 'kpts', 'kpt_primary')
@@ -84,9 +77,6 @@ class RenderTask:
     record_path: Path   # its render record, written once the mp4 is in place (and fsynced)
     persons: bool
     marker: Stamp       # the done marker when the task was made
-    # The render record to write: RECORD_VERSION, or 1 (the class default) for a task pickled by
-    # an older render-done parent, which compares version-1 records only.
-    record_version: int = 1
 
 
 @dataclass(frozen=True)
@@ -164,10 +154,10 @@ def render_committed(out_root: Path, vis_dir: Path, video_paths: Mapping[str, Pa
     - Holds <vis_dir>/.state/lock for the whole run (RuntimeError if another run holds it) and
       first deletes the .part files that killed renders left behind.
     - Skips a video whose render record matches `persons`, its mp4 and its current overlay inputs
-      (module docstring; a version-1 record is upgraded while its done marker is unchanged), and
+      (module docstring), and
       looks again at the next pass at one whose record vouches for its mp4 while the done marker
       does not describe the files (a commit in progress; summary.pending lists those still so at
-      the end); renders at most `limit` videos (0: only checks and upgrades the records); up to `jobs`
+      the end); renders at most `limit` videos (0: only checks the records); up to `jobs`
       render processes at a time, each of which is stopped when this process dies. `video_paths`
       maps ids to source videos.
     - A failed video is logged and skipped (retried only once its done marker changes); a render
@@ -289,7 +279,7 @@ class _Batch:
                 continue
             self.running[vid] = _launch(RenderTask(vid, Path(self._video_paths[vid]), self.layout.root,
                                                    self._vis_dir / f'{vid}.mp4', _record_path(self._vis_dir, vid),
-                                                   self._persons, marker, RECORD_VERSION))
+                                                   self._persons, marker))
 
     def collect(self, timeout: Optional[float]) -> None:
         """Wait up to `timeout` s (None = until one ends) and handle every render that ended."""
@@ -302,8 +292,8 @@ class _Batch:
 
     def _is_fresh(self, vid: str, marker: Stamp) -> Optional[bool]:
         """True when <vid>.mp4 exists and its render record says it was drawn, with these options,
-        from what the current files would draw (module docstring; the record is then refreshed or
-        upgraded). None when that record has these options and mp4 but the done marker does not
+        from what the current files would draw (module docstring; the record is then refreshed). None
+        when that record has these options and mp4 but the done marker does not
         describe the files now (overlay_inputs None: a commit in progress, or cut short): rendering
         now would redo an mp4 that a meta-only commit leaves up to date, so look again later.
         Else False."""
@@ -313,25 +303,15 @@ class _Batch:
             mp4 = (self._vis_dir / f'{vid}.mp4').stat()
         except (OSError, ValueError):
             return False
-        if not isinstance(record, dict):
+        if not (isinstance(record, dict) and record.get('version') == RECORD_VERSION
+                and record.get('persons') == self._persons and record.get('mp4') == [mp4.st_ino, mp4.st_size]):
             return False
-        if record.get('version') == RECORD_VERSION:
-            if record.get('persons') != self._persons or record.get('mp4') != [mp4.st_ino, mp4.st_size]:
-                return False
-            if record.get('files') == _file_key(self.layout, vid):
-                return True                     # the very files it was drawn from
-            state = overlay_inputs(self.layout, vid, self._persons)
-            if state is None:
-                return None
-            if state[0] != record.get('inputs'):
-                return False
-        elif record == _render_record(marker, self._persons, mp4):   # version 1: drawn from this commit
-            state = overlay_inputs(self.layout, vid, self._persons)
-            if state is None:
-                return None
-            if state[1][0] != list(marker):     # re-committed since `marker` was read
-                return False
-        else:
+        if record.get('files') == _file_key(self.layout, vid):
+            return True                     # the very files it was drawn from
+        state = overlay_inputs(self.layout, vid, self._persons)
+        if state is None:
+            return None
+        if state[0] != record.get('inputs'):
             return False
         try:
             _write_json(path, _inputs_record(self._persons, mp4, *state))
@@ -368,13 +348,6 @@ def _stamp(path: Path) -> Optional[Stamp]:
 
 def _record_path(vis_dir: Path, vid: str) -> Path:
     return vis_dir / RECORDS / f'{vid}.json'
-
-
-def _render_record(marker: Stamp, persons: bool, mp4: os.stat_result) -> Dict[str, object]:
-    """A version-1 render record (as JSON): what render-done wrote before RECORD_VERSION, and what
-    a running older render-done parent still compares. The mp4's inode is new after each render,
-    so an older record never matches a newer mp4."""
-    return dict(marker=list(marker), persons=persons, mp4=[mp4.st_ino, mp4.st_size])
 
 
 def _inputs_record(persons: bool, mp4: os.stat_result, inputs: Inputs, files: FileKey) -> Dict[str, object]:
@@ -432,14 +405,7 @@ def _write_json(path: Path, obj: object) -> None:
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, path)
-    fd = os.open(str(path.parent), os.O_RDONLY)
-    try:
-        os.fsync(fd)
-    except OSError as e:
-        if e.errno != errno.EINVAL:   # some filesystems cannot fsync a directory; renames stay atomic
-            raise
-    finally:
-        os.close(fd)
+    fsync_path(path.parent)
 
 
 def _remove_stale_parts(vis_dir: Path) -> None:
@@ -517,24 +483,6 @@ def _log_summary(summary: RenderSummary, layout: OutputLayout, video_ids: Option
         log.warning('not committed, so not rendered: %s', ' '.join(missing))
 
 
-def _raise_interrupt(signum, frame) -> None:
-    raise KeyboardInterrupt
-
-
-@contextlib.contextmanager
-def sigterm_as_interrupt() -> Iterator[None]:
-    """SIGTERM raises KeyboardInterrupt like Ctrl-C inside the block, so the render clean-up runs
-    (a no-op outside the main thread)."""
-    if threading.current_thread() is not threading.main_thread():
-        yield
-        return
-    previous = signal.signal(signal.SIGTERM, _raise_interrupt)
-    try:
-        yield
-    finally:
-        signal.signal(signal.SIGTERM, previous)
-
-
 # --------------------------------------------------------------------------- render process
 def _render_process(task: RenderTask, conn: mp_connection.Connection) -> None:
     """Child process: render one video and send its RenderResult; exit code 130 when stopped."""
@@ -570,35 +518,24 @@ def _interrupt_once(signum, frame) -> None:
 
 
 def _render(task: RenderTask) -> RenderResult:
-    """Render the mp4, then write its render record (version 1 for an older parent's task)."""
-    from .render import durable_replace, render_video
+    """Render the mp4, then write its render record."""
+    from .render import render_video
     from .video import probe
     started = time.monotonic()
     layout = OutputLayout(task.root)
     try:
         video = probe(task.video_path, task.video_id)
-        if task.record_version < RECORD_VERSION:   # an older render-done parent: its record and its rule
-            render_video(task.root, video, task.out_path, persons=task.persons)
-            if _stamp(layout.done_marker(task.video_id)) != task.marker:
-                task.out_path.unlink()
-                raise RuntimeError('the done marker changed while rendering (re-extracted or derived); '
-                                   'the video is rendered again once it is committed')
-            frames, mp4 = probe(task.out_path).nb_frames, task.out_path.stat()
-            tmp = task.record_path.with_name(f'{task.record_path.name}.{os.getpid()}.part')
-            tmp.write_text(json.dumps(_render_record(task.marker, task.persons, mp4)) + '\n')
-            durable_replace(tmp, task.record_path)
-        else:
-            before = overlay_inputs(layout, task.video_id, task.persons)
-            if before is None:
-                raise RuntimeError(NOT_COMMITTED)
-            render_video(task.root, video, task.out_path, persons=task.persons)
-            after = overlay_inputs(layout, task.video_id, task.persons)
-            if after is None or after[0] != before[0]:
-                task.out_path.unlink()
-                raise RuntimeError('what the overlay draws changed while rendering (re-extracted or derived); '
-                                   'the video is rendered again once it is committed')
-            frames, mp4 = probe(task.out_path).nb_frames, task.out_path.stat()
-            _write_json(task.record_path, _inputs_record(task.persons, mp4, *after))
+        before = overlay_inputs(layout, task.video_id, task.persons)
+        if before is None:
+            raise RuntimeError(NOT_COMMITTED)
+        render_video(task.root, video, task.out_path, persons=task.persons)
+        after = overlay_inputs(layout, task.video_id, task.persons)
+        if after is None or after[0] != before[0]:
+            task.out_path.unlink()
+            raise RuntimeError('what the overlay draws changed while rendering (re-extracted or derived); '
+                               'the video is rendered again once it is committed')
+        frames, mp4 = probe(task.out_path).nb_frames, task.out_path.stat()
+        _write_json(task.record_path, _inputs_record(task.persons, mp4, *after))
     except Exception as exc:
         return RenderResult(task.video_id, error=f'{type(exc).__name__}: {exc}')
     return RenderResult(task.video_id, frames, time.monotonic() - started, mp4.st_size)

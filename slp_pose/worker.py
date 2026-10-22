@@ -1,4 +1,4 @@
-"""One extraction process per GPU (spec §4.3): decode thread -> detect -> select -> crops -> pose -> append.
+"""One extraction process per GPU: decode thread -> detect -> select -> crops -> pose -> append.
 
 `ChunkProcessor` is the whole per-chunk GPU pipeline and is shared with parity.py, so parity
 measures exactly the code that extracts. Importing this module does not import torch, so it
@@ -13,7 +13,7 @@ Protocol with the parent (run.py is the other side):
   and survives a later crash.
 - SIGINT / SIGTERM, or the death of the parent, request a stop: the worker stops at the next chunk
   boundary (never inside a commit), deletes the unfinished spill and sends 'exit'.
-- Decoder errors (D28): from its first task on, the worker's file descriptor 2 (where libav and
+- Decoder errors: from its first task on, the worker's file descriptor 2 (where libav and
   OpenCV print, from C) is its decode log <out_root>/.state/logs/decode_gpu<N>_<stamp>.log, with
   BEGIN / END markers around each video the reader decodes and COMMIT after each commit
   (decodelog.py), so `check` can name the videos whose decoding printed errors. Python's
@@ -54,7 +54,7 @@ _GPU_ERROR = re.compile(r'cuda|cudnn|cublas|tensorrt|nvrtc|device-side assert', 
 
 
 class ChunkProcessor:
-    """GPU pipeline for one chunk; single CUDA stream, synchronous (spec §4.3 last line).
+    """GPU pipeline for one chunk; single CUDA stream, synchronous.
 
     For a chunk of F frames of size (W, H): detect on the letterbox (det_batch frames per call),
     select the posed rows (at most K per frame; POSED bits are set in place), cut their crops from
@@ -120,12 +120,7 @@ def _empty_poses(num_frames: int) -> ChunkPoses:
 
 @dataclass(frozen=True)
 class VideoTask:
-    """One unit of work sent by the parent to a worker (picklable).
-
-    A respawned worker unpickles VideoTasks made by the parent's (possibly older) code: fields are
-    only ever added at the end, each with a plain default (an older pickle then reads the class
-    default), and never renamed or removed (tests/test_pickle_compat.py).
-    """
+    """One unit of work sent by the parent to a worker (picklable)."""
 
     video: VideoInfo
     out_root: str               # absolute output root
@@ -133,17 +128,14 @@ class VideoTask:
     allow_frame_mismatch: bool = False
     attempt: int = 1
     # datasets.reference of the extracted dataset: the worker imports it to resolve a per-frame rule
-    # of the dataset's own (Dataset.rules, D22). None: the framework's rule, or a built-in
-    # dataset's (every task of a parent from before D22; task_rule).
+    # of the dataset's own (Dataset.rules). None when the extraction rule is the framework's.
     dataset: Optional[str] = None
 
 
 def task_rule(task: VideoTask) -> FrameRule:
     """The per-frame rule a task is extracted with: the framework's rule of that name, else the
     dataset's own (task.dataset is imported in this process, as a spawned worker has not imported
-    it; datasets.dataset_class). A task without a dataset comes from a parent from before D22,
-    whose per-frame rules are now the framework's or a built-in dataset's own (rules.as_rule,
-    datasets.builtin_rule). KeyError for an unknown or video-level rule."""
+    it; datasets.dataset_class). KeyError for an unknown or video-level rule."""
     from . import rules
     if task.dataset is not None and not rules.is_framework_name(task.primary_rule):
         from .datasets import dataset_class
@@ -162,8 +154,8 @@ class WorkerEvent:
       'progress'  heartbeat, every HEARTBEAT_S s while the worker makes progress or waits for
                   work (a hung worker goes silent); frames = frames done in the current video
       'done'      payload = dataclasses.asdict(record.CommitInfo)
-      'read_fault' the commit's verification read the video's spill again after a failed read (D28;
-                  record.SpillWriter); payload {'warning'}. Sent before the video's 'done' or 'failed'
+      'read_fault' the commit's verification read the video's spill again after a failed read
+                  (record.SpillWriter); payload {'warning'}. Sent before the video's 'done' or 'failed'
       'failed'    per-video failure, worker continues; payload {'error', 'traceback', 'attempt'}
       'fatal'     the worker cannot continue (CUDA/TensorRT error, failed setup); payload
                   {'error', 'traceback'}; video_id = the video in progress; exit code 3
@@ -183,7 +175,7 @@ def is_gpu_error(exc: BaseException) -> bool:
     """CUDA / cuDNN / cuBLAS / TensorRT failures (incl. CUDA OOM, engine RuntimeErrors).
 
     After one of these the process's CUDA state is suspect, so the worker exits and the parent
-    respawns it instead of carrying on with the next video (spec §4.4).
+    respawns it instead of carrying on with the next video.
     """
     return isinstance(exc, RuntimeError) and bool(_GPU_ERROR.search(str(exc)))
 

@@ -3,7 +3,7 @@
 CPU only: imports select, signer, rules, meta and env; detpost (which imports torch) only inside `derive`; never
 engines.
 
-Layout under an output root <root> (spec §4.1, §4.4):
+Layout under an output root <root>:
   poses/<vid>.npy          (T,133,3) float32 C-order, npy format v1.0, primary signer only;
                            bytes identical to np.save(path, poses) of the same array.
   persons/<vid>.npz        np.savez (stored, zip64) with exactly PERSONS_MEMBERS.
@@ -13,7 +13,7 @@ Layout under an output root <root> (spec §4.1, §4.4):
   .state/failed.jsonl      one JSON object per failed attempt: {video_id, error, traceback, attempt, gpu, time}.
 video_meta.csv is written only by the parent (run.merge_meta via meta.write_video_meta).
 
-persons/<vid>.npz members (spec §4.1; numpy dtypes exact, 0-d arrays for scalars/strings):
+persons/<vid>.npz members (numpy dtypes exact, 0-d arrays for scalars/strings):
   schema_version int64 0-d = types.SCHEMA_VERSION; video_id str 0-d; frame_size (2,) int64 (W,H);
   fps (2,) int64 (num,den); num_frames int64 0-d = T; det_offsets (T+1,) int64; det_boxes (N,4)
   float32; det_scores (N,) float32; det_flags (N,) uint8; num_persons (T,) uint8; kpt_offsets
@@ -27,21 +27,19 @@ Invariants (PersonsRecord.problems, run at finalize and by `check`):
   rule (signer.VideoRule) the rule's choice among the posed rows of the whole video (it sees
   signer.PosedPeople: their boxes, scores and keypoints), which may also be -1 where the pose set
   is not empty (no signer on screen). The rule is the framework's of that name, or a dataset's own
-  (Dataset.rules, D22): functions that apply or check a rule take the rule object (Dataset.rule)
-  or a framework rule's name, and `check` takes the dataset;
+  (Dataset.rules): functions that apply or check a rule take the rule object (Dataset.rule) or a
+  framework rule's name, and `check` takes the dataset;
   num_persons[t] == number of COUNT_SET rows of frame t;
   kpt_det rows of frame t are exactly its POSED rows, ascending; POSED implies POSE_SET; det rows
   within a frame have non-increasing scores. Also checked: dtypes, shapes and CSR indices, and
-  `meta` is the row computed from the record (poses/ and the meta row are pure functions of the
-  record) under the definitions its provenance['meta_version'] names: meta.META_VERSION = the
-  current row (meta.meta_row; a video-level rule's candidates are the people in its region,
-  signer.SignerChoice.region), absent = the legacy whole-frame row (meta.legacy_meta_row).
-  Extraction commits with a per-frame rule and the legacy whole-frame row (meta_version absent,
-  commit_derivation_hash); `derive` writes the current row, so the parent derives every commit
-  (its derivation_hash is never the target derivation_hash) and an outdated record is re-derived
-  by `derive` and by the next `extract`. A record derived under another meta_version (by older
-  code, whose rules may pick otherwise) is reported in one line, without its picks and meta row
-  checked, until it is re-derived.
+  `meta` is the row computed from the record: meta.meta_row, with a video-level rule's candidates
+  the people in its region (signer.SignerChoice.region; poses/ and the meta row are pure functions
+  of the record).
+  A GPU worker commits with its per-frame extraction rule, the whole-frame row and
+  commit_derivation_hash (no meta_version); the parent derives it right after, and an outdated
+  record is re-derived by `derive` and by the next `extract`. A record derived under another
+  meta_version is reported in one line, without its picks and meta row checked, until it is
+  re-derived.
 Commit (finalize and derive): every file is staged and fsynced in .work/<vid>/, then os.replace
   persons/<vid>.npz -> poses/<vid>.npy -> .state/meta/<vid>.json, fsync those directories, then
   os.replace .state/done/<vid>.json and fsync its directory, so a done marker always describes
@@ -54,27 +52,22 @@ Commit (finalize and derive): every file is staged and fsynced in .work/<vid>/, 
   length) and dies after replacing persons/ but before the marker reads as 'extract' (a GPU
   re-extraction; nothing is lost). Ctrl-C and SIGTERM never cut a derive short
   (run.deferred_interrupt).
-CRCs (D26): a memmap never checks a zip member's CRC-32 and save_persons writes fresh ones, so
-  derive first reads the whole persons file once through zipfile (crc_problems) and refuses a
-  damaged one (nothing is written; only a re-extraction can restore it), and it publishes nothing
-  unless the members it copies unchanged were staged with the CRCs that read verified (its memmaps
-  read the file a second time); check does the same read unless told not to.
-Read faults (D28): this machine's Storage path returns a wrong byte now and then, mostly
-  transiently. So every check that reads files to verify them retries a failure before it believes
-  it, up to _READ_ATTEMPTS reads in all, the files evicted from the page cache in between (evict): a
-  CRC failure (crc_problems: the whole file is read again), a derive whose second read differs from
-  the first or whose staged poses differ from the record (ReadFault: the whole stage is redone),
-  finalize's comparison of the staged poses with the spill, and check's bitwise poses-vs-persons
-  comparison. Each retried failure is reported (a WARNING by default, `report` callbacks
-  otherwise); a failure on every read fails as before (a ReadFault or CrcFailure is a ValueError).
-  These retries cure a fault above the disk's cache only: on the ntfs-3g (fuseblk) Storage mount
-  evict drops nothing that matters (FUSE re-reads a file on each open anyway), and ntfs-3g reads
-  through /dev/sda1's page cache, which only root can drop, so a wrong byte the disk delivered
-  repeats on every immediate re-read while it stays cached (measured 2026-10-06: most re-reads after
-  evict ran at 0.7-1.5 GB/s, above the SATA link's ~600 MB/s). A later read is the real second
-  chance: the extract parent derives a video refused by a ReadFault or CrcFailure once more at the
-  end of its run, and `check` can be run again, after `sudo sh -c 'sync; echo 1 >
-  /proc/sys/vm/drop_caches'` for a read from the disk itself.
+CRCs: a memmap never checks a zip member's CRC-32 and save_persons writes fresh ones, so derive
+  first reads the whole persons file once through zipfile (crc_problems) and refuses a damaged one
+  (nothing is written; only a re-extraction can restore it), and it publishes nothing unless the
+  members it copies unchanged were staged with the CRCs that read verified (its memmaps read the
+  file a second time); check does the same read unless told not to.
+Read faults: a disk can return a wrong byte now and then, mostly transiently. So every check that
+  reads files to verify them retries a failure before it believes it, up to _READ_ATTEMPTS reads in
+  all, the files evicted from the page cache in between (evict): a CRC failure (crc_problems: the
+  whole file is read again), a derive whose second read differs from the first or whose staged
+  poses differ from the record (ReadFault: the whole stage is redone), finalize's comparison of the
+  staged poses with the spill, and check's bitwise poses-vs-persons comparison. Each retried
+  failure is reported (a WARNING by default, `report` callbacks otherwise); a failure on every read
+  is raised (ReadFault or CrcFailure, both ValueErrors). On a FUSE mount such as ntfs-3g the
+  re-reads may come from a cache an unprivileged process cannot drop; there the extract parent's
+  end-of-run retry of a refused derive, or `check` after dropping the caches as root, is the real
+  second read.
 Memory: a SpillWriter holds one chunk; finalize, derive and check read the big columns through
   memmaps and handle kpts/poses in blocks of _BLOCK_FRAMES frames, so RAM is O(T + N) small
   arrays plus one block, for any video length.
@@ -103,8 +96,8 @@ import numpy as np
 
 from . import env
 from . import signer
-from .meta import META_VERSION, MSLT_COMMIT, legacy_meta_row, meta_row, people_in_region
-from .rules import Rule, RuleLike, as_frame_rule, as_rule, is_video_rule
+from .meta import META_VERSION, MSLT_COMMIT, meta_row, people_in_region
+from .rules import Rule, RuleLike, as_frame_rule, as_rule
 from .select import DEFAULT_POSING_RULES, FrameRule
 from .settings import Settings
 from .types import COUNT_SET, NUM_KEYPOINTS, POSE_SET, POSED, SCHEMA_VERSION, ChunkDets, ChunkPoses, VideoInfo
@@ -131,7 +124,7 @@ _CRC_READ = 16 << 20        # bytes per read when crc_problems verifies a zip
 _DERIVE_KEEPS = ('schema_version', 'video_id', 'frame_size', 'fps', 'num_frames', 'det_offsets', 'det_boxes',
                  'det_scores', 'kpt_offsets', 'kpt_det', 'kpts')
 _REEXTRACT = 're-extract the video: delete its done marker'
-_READ_ATTEMPTS = 3          # reads of a file being verified before its failure is believed (D28)
+_READ_ATTEMPTS = 3          # reads of a file being verified before its failure is believed
 _POSES_MISMATCH = 'poses rows are not the primary keypoints'   # the bitwise poses-vs-record problem
 # Spill columns in .work/<vid>/<name>.bin: dtype and per-row shape. *_ends are the CSR offsets
 # without their leading 0; kpt_det is already video-global.
@@ -194,16 +187,15 @@ class CommitInfo:
 
 
 class ReadFault(ValueError):
-    """A comparison of two reads of the same bytes failed (D28): derive's memmaps against its CRC
-    check, or staged poses against the record they were made from (the bitwise poses problem). On
-    this machine that is a transient read fault as often as damage, so derive and finalize redo
-    the reading after evicting the files from the page cache before they give up with it."""
+    """A comparison of two reads of the same bytes failed: derive's memmaps against its CRC check,
+    or staged poses against the record they were made from (the bitwise poses problem). That is
+    often a transient read fault rather than damage, so derive and finalize redo the reading after
+    evicting the files from the page cache before they give up with it."""
 
 
 class CrcFailure(ValueError):
     """derive refused a persons file that failed its CRC check, or had no readable zip directory,
-    on every read of crc_problems (D28). Those reads are not independent on the ntfs-3g Storage
-    mount (module docstring: a wrong byte the disk delivered stays in /dev/sda1's cache), so the
+    on every read of crc_problems. Those re-reads may come from a cache (module docstring), so the
     extract parent derives the video once more at the end of its run before the failure stands."""
 
 
@@ -233,17 +225,12 @@ class PersonsRecord:
     meta: Dict[str, object]
     provenance: Dict[str, object]
 
-    def poses(self) -> np.ndarray:
-        """(T,133,3) float32: the primary's kpts row per frame, zeros where kpt_primary == -1."""
-        return self._pose_block(0, self.num_frames)
-
     def problems(self, poses: Optional[np.ndarray] = None, rule: Optional[RuleLike] = None,
                  dataset: Optional[RuleSource] = None) -> List[str]:
         """Invariant violations as readable lines (empty = OK); `poses` is checked if given. `rule`
         is the record's primary_rule as a rule object (a dataset's own rule, Dataset.rule); None =
-        resolved by `dataset` (Dataset.rule: a name it does not know is a problem, even another
-        built-in dataset's own rule), else by name alone (rules.as_rule: the framework's or a
-        built-in dataset's own)."""
+        resolved by `dataset` (Dataset.rule: a name it does not know is a problem), else by name
+        alone (rules.as_rule: the framework's rules only)."""
         out = self._structure_problems()
         if out:
             return out
@@ -277,17 +264,16 @@ class PersonsRecord:
             out.append(f"the record's primary rule is {self.primary_rule!r}, not {rule.name!r}")
             return out
         version = self.provenance.get('meta_version')
-        if version not in (None, META_VERSION):   # derived by older (or newer) code, whose rules may pick otherwise
+        if version not in (None, META_VERSION):   # derived under other meta definitions, whose rules may pick otherwise
             out.append(f'derived by other code (meta_version {version!r}, this code writes {META_VERSION}): its '
                        f'picks and meta row are not checked; `derive` re-derives it')
         else:
             position, not_posed, region = _rule_primary(self, rule)
             _report(out, f'the {self.primary_rule!r} pick is not posed', np.flatnonzero(not_posed))
-            empty = 'where it finds no signer' if is_video_rule(rule) else 'exactly without a pose set'
+            empty = 'where it finds no signer' if isinstance(rule, signer.VideoRule) else 'exactly without a pose set'
             _report(out, f'kpt_primary is not the {self.primary_rule!r} pick (-1 {empty})',
                     np.flatnonzero(~not_posed & (position != self.kpt_primary)))
-            if _canonical(_meta_row(self, region) if version == META_VERSION else
-                          _legacy_meta_row(self)) != _canonical(self.meta):
+            if _canonical(_meta_row(self, region)) != _canonical(self.meta):
                 out.append('meta is not the row computed from the record')
         if poses is not None:
             out.extend(self._poses_problems(poses))
@@ -361,14 +347,14 @@ def _rule_primary(record: PersonsRecord, rule: RuleLike) -> Tuple[np.ndarray, np
     video-level rule, which chooses among the posed rows), and for a video-level rule the (T,4)
     interpreter's region (signer.SignerChoice.region; None for a per-frame rule). A video-level
     rule sees signer.PosedPeople: the posed boxes, scores and keypoints (record.kpts, read only as
-    far as the rule reads them: BOBSL's signer_track the shoulders, D24, Auslan News'
-    signer_track_right the shoulders and wrists, D21). Raises ValueError when a video-level rule
-    returns a malformed choice."""
+    far as the rule reads them: signer_track reads the shoulders, Auslan News' signer_track_right
+    the shoulders and wrists). Raises ValueError when a video-level rule returns a malformed
+    choice."""
     rule = as_rule(rule)
     det_offsets, kpt_offsets = np.asarray(record.det_offsets), np.asarray(record.kpt_offsets)
     boxes, scores, kpt_det = np.asarray(record.det_boxes), np.asarray(record.det_scores), np.asarray(record.kpt_det)
     not_posed = np.zeros(record.num_frames, bool)
-    if is_video_rule(rule):
+    if isinstance(rule, signer.VideoRule):
         people = signer.PosedPeople(boxes[kpt_det], scores[kpt_det], kpt_offsets, record.kpts, record.fps,
                                     record.frame_size)
         primary, region = _checked_choice(rule.name, rule.choose(people), np.diff(kpt_offsets))
@@ -403,22 +389,15 @@ def _checked_choice(name: str, choice: signer.SignerChoice, posed: np.ndarray) -
     return primary, region
 
 
-def _meta_row(record: PersonsRecord, region: Optional[np.ndarray]) -> Dict[str, object]:
-    """The current meta row of `record` (meta.meta_row): masked_runs over the posed people inside
-    `region` (a video-level rule's, from _rule_primary) plus the primary when it is given, else over
-    every posed person."""
+def _meta_row(record: PersonsRecord, region: Optional[np.ndarray] = None) -> Dict[str, object]:
+    """The meta row of `record` (meta.meta_row): masked_runs over the posed people inside `region`
+    (a video-level rule's, from _rule_primary) plus the primary when it is given, else over every
+    posed person."""
     candidates = None
     if region is not None:
-        candidates = people_in_region(region, record.det_offsets, record.det_boxes, record.det_flags,
-                                      record.kpt_det).posed
+        candidates = people_in_region(region, record.det_offsets, record.det_boxes, record.kpt_det)
     return meta_row(record.video_id, record.frame_size, record.fps, record.num_persons, record.kpt_offsets,
                     record.kpts, record.kpt_primary, candidates)
-
-
-def _legacy_meta_row(record: PersonsRecord) -> Dict[str, object]:
-    """The legacy whole-frame meta row of `record` (meta.legacy_meta_row): what finalize commits."""
-    return legacy_meta_row(record.video_id, record.frame_size, record.fps, record.num_persons, record.kpt_offsets,
-                           record.kpts, record.kpt_primary)
 
 
 def load_persons(path: Path, mmap_mode: Optional[str] = None) -> PersonsRecord:
@@ -487,8 +466,8 @@ def crc_problems(path: Path, report: Optional[Report] = None) -> List[str]:
     whole file once, sequentially, through zipfile, which checks each member's CRC at its end
     (load_persons with mmap_mode never does). A read that finds a failure is followed by another of
     the whole file after it is evicted from the page cache, up to _READ_ATTEMPTS reads in all; the
-    file is intact as soon as one read finds every member intact (D28: a transient read fault
-    passes on a re-read). Each retried read goes to `report`. When every read fails, the lines name
+    file is intact as soon as one read finds every member intact (a transient read fault passes on
+    a re-read). Each retried read goes to `report`. When every read fails, the lines name
     the members that failed on every read, else (a member name read differently, e.g. a fault in
     the zip directory) those of the last read. Raises zipfile.BadZipFile when no read finds a
     readable central directory."""
@@ -540,12 +519,10 @@ def _open_zip(path: Path, report: Optional[Report]) -> zipfile.ZipFile:
 
 def evict(*paths: Path, sync: bool = False) -> None:
     """Drop the cached pages of `paths` from the page cache (posix_fadvise POSIX_FADV_DONTNEED), so
-    the next read does not return a cached copy of a faulty read (D28). On a local file system
-    (ext4 on the SSD) that read then comes from the disk. On the ntfs-3g (fuseblk) Storage mount it
-    does not: this drops only FUSE's pages of the file (none: FUSE re-reads on each open), while
-    ntfs-3g reads through /dev/sda1's page cache, which an unprivileged process cannot drop, so a
-    wrong byte that came from the disk and is still cached comes back (module docstring). DONTNEED
-    drops only clean pages that nobody maps: release memmaps of the file first, and pass `sync` for
+    the next read does not return a cached copy of a faulty read. On a local file system the next
+    read then comes from the disk; on a FUSE mount such as ntfs-3g the underlying block device's
+    cache, which an unprivileged process cannot drop, may still serve it (module docstring).
+    DONTNEED drops only clean pages that nobody maps: release memmaps of the file first, and pass `sync` for
     a file written without fsync (it writes the dirty pages back first). Best effort: a missing
     file, a system without posix_fadvise or a refusal is skipped (the re-read is verified anyway)."""
     for path in paths:
@@ -691,13 +668,9 @@ class SpillWriter:
         self._frames = self._dets = self._kpts = 0
         self._state = 'open'   # -> 'closed' (finalize started) -> 'done' (committed or aborted)
 
-    @property
-    def frames_written(self) -> int:
-        return self._frames
-
     def append(self, start: int, dets: ChunkDets, poses: ChunkPoses) -> None:
-        """Append one chunk. `start` (video frame index of the chunk's first frame) must equal
-        frames_written; dets/poses are chunk-local (poses.det_index indexes dets rows) and are
+        """Append one chunk. `start` (video frame index of the chunk's first frame) must equal the
+        number of frames appended so far; dets/poses are chunk-local (poses.det_index indexes dets rows) and are
         converted to video-global det rows here; num_persons comes from dets.num_persons()."""
         vid = self.video.video_id
         if self._state != 'open':
@@ -726,8 +699,8 @@ class SpillWriter:
         self._kpts += len(poses.det_index)
 
     def finalize(self, settings: Settings, provenance: Dict[str, object]) -> CommitInfo:
-        """Close the spill, build the legacy meta row (meta.legacy_meta_row with T = frames_written),
-        write persons/poses/meta/done via temp files, check invariants (raise on any problem),
+        """Close the spill, build the whole-frame meta row (meta.meta_row), write persons/poses/meta/done
+        via temp files, check invariants (raise on any problem),
         commit in the documented order and remove .work/<vid>/. `provenance` comes from
         make_provenance; its hashes (checked against `settings` and the rule) go into the done
         marker. On an exception, call abort()."""
@@ -762,7 +735,7 @@ class SpillWriter:
         """Build the record from memmaps of the spill columns, validate it, stage its files. The
         validation reads back the staged poses and the spill (written just now); when they differ
         (ReadFault), both are evicted from the page cache and read again, up to _READ_ATTEMPTS
-        times, so a transient read fault costs a re-read instead of a re-extraction (D28)."""
+        times, so a transient read fault costs a re-read instead of a re-extraction."""
         attempt = 1
         while True:
             record = self._record(provenance)
@@ -781,7 +754,7 @@ class SpillWriter:
         return _stage_files(self._dir, record)
 
     def _record(self, provenance: Dict[str, object]) -> PersonsRecord:
-        """The record over memmaps of the spill columns, with its legacy meta row."""
+        """The record over memmaps of the spill columns, with its whole-frame meta row."""
         columns = {name: _read_column(self._dir / f'{name}.bin', dtype, shape)
                    for name, (dtype, shape) in _SPILL_COLUMNS.items()}
         zero = np.zeros(1, np.int64)
@@ -793,8 +766,7 @@ class SpillWriter:
             num_persons=columns['num_persons'], kpt_offsets=np.concatenate([zero, columns['kpt_ends']]),
             kpt_det=columns['kpt_det'], kpts=columns['kpts'], kpt_primary=columns['kpt_primary'],
             primary_rule=self.primary_rule, meta={}, provenance=provenance)
-        record.meta = legacy_meta_row(v.video_id, record.frame_size, record.fps, record.num_persons,
-                                      record.kpt_offsets, record.kpts, record.kpt_primary)
+        record.meta = _meta_row(record)
         return record
 
 
@@ -844,13 +816,13 @@ def _publish(layout: OutputLayout, work: Path, video_id: str, drop_old_marker: b
         directory.mkdir(parents=True, exist_ok=True)
     if drop_old_marker and marker.exists():
         marker.unlink()
-        _fsync_dir(marker.parent)
+        fsync_path(marker.parent)
     for src, dst in moves:
         os.replace(src, dst)
     for _, dst in moves:
-        _fsync_dir(dst.parent)
+        fsync_path(dst.parent)
     os.replace(work / _STAGED_DONE, marker)
-    _fsync_dir(marker.parent)
+    fsync_path(marker.parent)
     shutil.rmtree(work)
 
 
@@ -877,7 +849,8 @@ def _write_text(path: Path, text: str) -> None:
         os.fsync(f.fileno())
 
 
-def _fsync_dir(path: Path) -> None:
+def fsync_path(path: Path) -> None:
+    """fsync a file or a directory (after a rename into it)."""
     fd = os.open(str(path), os.O_RDONLY)
     try:
         os.fsync(fd)
@@ -886,6 +859,14 @@ def _fsync_dir(path: Path) -> None:
             raise
     finally:
         os.close(fd)
+
+
+def atomic_write_text(path: Path, text: str) -> None:
+    """Write `text` to `path` through a temporary file and os.replace, so a reader sees the old or the
+    new file, never part of one."""
+    tmp = path.with_name(path.name + '.tmp')
+    tmp.write_text(text)
+    os.replace(tmp, path)
 
 
 # --------------------------------------------------------------------------- hashes and provenance
@@ -919,7 +900,7 @@ def derivation_hash(settings: Settings, primary_rule: RuleLike) -> str:
     is a rule object (a dataset's own, Dataset.rule) or a framework rule's name."""
     rule = as_rule(primary_rule)
     fields = settings.derivation_fields(rule.name)
-    if is_video_rule(rule) or rule.params is not None:
+    if isinstance(rule, signer.VideoRule) or rule.params is not None:
         fields['primary_rule_params'] = dict(rule.params)
     fields['meta_version'] = META_VERSION
     return _sha256_json(fields)
@@ -927,10 +908,9 @@ def derivation_hash(settings: Settings, primary_rule: RuleLike) -> str:
 
 def commit_derivation_hash(settings: Settings, primary_rule: Union[str, FrameRule]) -> str:
     """The derivation_hash of a GPU worker's commit with the per-frame rule `primary_rule`
-    (SpillWriter.finalize, which writes the legacy whole-frame meta row): sha256 hex of
-    json.dumps(settings.derivation_fields(<its name>), sort_keys=True), unchanged since the BOBSL
-    production run started (tests/test_compat.py); the rule's params are not in it. It never equals
-    derivation_hash, so the parent derives every commit before counting it done (run.py)."""
+    (SpillWriter.finalize): sha256 hex of json.dumps(settings.derivation_fields(<its name>),
+    sort_keys=True); the rule's params and meta_version are not in it, so it never equals
+    derivation_hash and the parent derives every commit before counting it done (run.py)."""
     return _sha256_json(settings.derivation_fields(as_frame_rule(primary_rule).name))
 
 
@@ -997,21 +977,21 @@ def record_failure(root: Path, video_id: str, error: str, traceback_text: str, a
 # --------------------------------------------------------------------------- derive
 def derive(root: Path, video_id: str, settings: Settings, primary_rule: RuleLike,
            report: Optional[Report] = None) -> CommitInfo:
-    """CPU re-derivation from persons/<vid>.npz (spec D6, D14, §4.4), no GPU.
+    """CPU re-derivation from persons/<vid>.npz, no GPU.
 
     `primary_rule` is a rule object (a dataset's own, Dataset.rule) or a framework rule's name.
     Recomputes COUNT_SET bits per frame with detpost.count_set_mask(det_boxes, det_scores,
     settings.count_score_thr, settings.count_nms_thr), num_persons, kpt_primary with a per-frame
     rule on each frame's POSE_SET rows (the pick must be a POSED row, else raise ValueError: the
     rule needs re-extraction) or with a video-level rule on the posed people
-    (signer.PosedPeople), then poses, the current meta row
-    (meta.meta_row; masked_runs over the people in the interpreter's region for a video-level rule)
+    (signer.PosedPeople), then poses, the meta row (meta.meta_row; masked_runs over the people in
+    the interpreter's region for a video-level rule)
     and the provenance's derivation_hash, count thresholds (in provenance['settings']),
     meta_version (meta.META_VERSION) and mslt_commit (meta.MSLT_COMMIT, the misaligned-slt
     commit the row's run definitions follow); POSE_SET, POSED, det_* and kpts are unchanged.
     Commits in the documented order. Deriving again with the same settings and rule reproduces
-    every output file byte-for-byte; a commit of the GPU workers (legacy meta row) changes only in
-    its meta row and provenance (and the done marker), never in what render-done draws.
+    every output file byte-for-byte; a GPU worker's commit derived with its own per-frame rule
+    changes only in its provenance (and the done marker), never in what render-done draws.
     poses/<vid>.npy is written only when its bytes change (_holds_poses), so such a derive rewrites
     persons/ and the small files but leaves poses/ untouched. A persons file that fails
     crc_problems, or is no readable zip, raises CrcFailure (a ValueError) before anything is staged
@@ -1019,12 +999,11 @@ def derive(root: Path, video_id: str, settings: Settings, primary_rule: RuleLike
     memmaps, so the staged members that derive keeps (_DERIVE_KEEPS) must have the CRCs just
     verified, else it raises ReadFault (a ValueError) and publishes nothing (a faulty second read
     would otherwise be committed).
-    Read faults (D28): crc_problems reads a failing file again; when the second read differs or
-    the staged poses differ from the record (ReadFault), the staged files are deleted, the persons
-    and poses files evicted from the page cache and the whole stage redone, up to _READ_ATTEMPTS
+    Read faults: crc_problems reads a failing file again; when the second read differs or the
+    staged poses differ from the record (ReadFault), the staged files are deleted, the persons and
+    poses files evicted from the page cache and the whole stage redone, up to _READ_ATTEMPTS
     stages; each retried failure goes to `report` (None: a WARNING in this module's log). A failure
-    on every attempt raises as before (on the Storage mount these re-reads are not independent of
-    the first: module docstring).
+    on every attempt is raised (re-reads may come from a cache: module docstring).
     """
     rule = as_rule(primary_rule)
     layout = OutputLayout(root)
@@ -1095,8 +1074,8 @@ def _stage_derived(layout: OutputLayout, work: Path, video_id: str, settings: Se
     committed = layout.poses(video_id)
     keep_poses = _holds_poses(committed, record)
     if keep_poses:
-        # Compared bit for bit just now: write nothing for poses/ (a meta-only derive, D19, then
-        # rewrites only persons/ and the small files on the volume).
+        # Compared bit for bit just now: write nothing for poses/ (a meta-only derive then rewrites
+        # only persons/ and the small files).
         _raise_problems(record, None, primary_rule)
     else:
         writer = NpyStreamWriter(work / _STAGED_POSES)
@@ -1115,8 +1094,9 @@ def _stage_derived(layout: OutputLayout, work: Path, video_id: str, settings: Se
 
 
 def _holds_poses(path: Path, record: PersonsRecord) -> bool:
-    """True when `path` is byte for byte what np.save writes for record.poses(): the np.save v1.0
-    header of (T,133,3) float32, the exact size, every row bitwise. Reads only, up to the first
+    """True when `path` is byte for byte what np.save writes for the record's poses (the primary's
+    kpts row per frame, zeros where kpt_primary == -1): the np.save v1.0 header of (T,133,3) float32,
+    the exact size, every row bitwise. Reads only, up to the first
     block that differs."""
     header = _npy_header(record.num_frames)
     try:
@@ -1150,23 +1130,24 @@ class CheckReport:
 def check(root: Path, video_id: str, switch_iou: float = 0.3, window_s: float = 2.0,
           dataset: Optional[RuleSource] = None, verify_crc: bool = True,
           report: Optional[Report] = None) -> CheckReport:
-    """Verify the §4.1 invariants for a committed video and flag primary switches.
+    """Verify the record's invariants (module docstring) for a committed video and flag primary
+    switches.
 
-    `dataset` (a Dataset or its class) resolves the record's primary_rule (Dataset.rule, D22: a
-    rule the dataset does not know, also another built-in dataset's own, is a problem); None = by
-    name alone (the framework's rules and the built-in datasets' own, rules.as_rule).
+    `dataset` (a Dataset or its class) resolves the record's primary_rule (Dataset.rule: a rule
+    the dataset does not know is a problem); None = by name alone (the framework's rules only,
+    rules.as_rule).
     Besides PersonsRecord.problems: the CRC-32 of every persons member (crc_problems: one
     sequential read of the file; `verify_crc` False skips it), the poses file header and size, the
     done marker (hashes, sizes, T) and the .state/meta row against the record. A switch is a frame
     t where both t-1 and t have a primary and IoU(primary box t-1, primary box t) < switch_iou.
     Suggested windows are [t - window_s*fps, t + window_s*fps) (rounded up to whole frames)
     clipped to [0, T) and merged when they overlap or touch.
-    Read faults (D28): a CRC failure (crc_problems) or poses that differ from the persons record
-    bit for bit are read again after both files are evicted from the page cache, up to
-    _READ_ATTEMPTS reads in all, and reported only when every read finds them (a re-read that
-    cannot load the files counts as a failed read; the CRC lines are kept); each retried failure
-    goes to `report` (None: a WARNING in this module's log). On the Storage mount these re-reads
-    are not independent of the first (module docstring): run check again later to re-read.
+    Read faults: a CRC failure (crc_problems) or poses that differ from the persons record bit for
+    bit are read again after both files are evicted from the page cache, up to _READ_ATTEMPTS reads
+    in all, and reported only when every read finds them (a re-read that cannot load the files
+    counts as a failed read; the CRC lines are kept); each retried failure goes to `report` (None: a
+    WARNING in this module's log). Re-reads may come from a cache (module docstring): run check
+    again later to re-read from the disk.
     """
     layout = OutputLayout(root)
     paths = (layout.persons(video_id), layout.poses(video_id), layout.meta_json(video_id), layout.done_marker(video_id))
@@ -1213,7 +1194,7 @@ def derivation_problems(root: Path, video_id: str, settings: Settings, primary_r
     """[] when the video's done marker has derivation_hash(settings, primary_rule), i.e. its outputs
     were derived with the dataset's final rule, count settings and meta definitions; else one line
     naming the rule they have (a commit left underived by a stop, crash or failed derive, or derived
-    by older code; `derive` fixes it).
+    under other rule parameters or meta definitions; `derive` fixes it).
     Missing or unreadable files are `check`'s problems, not reported here."""
     rule = as_rule(primary_rule)
     primary_rule = rule.name

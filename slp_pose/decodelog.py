@@ -1,9 +1,8 @@
-"""Per-worker decoder logs (D28): which video's decoding made libav print errors.
+"""Per-worker decoder logs: which video's decoding made libav print errors.
 
 OpenCV's FFmpeg backend lets libav print its errors ('error while decoding MB', 'Invalid NAL unit
 size', 'concealing ... errors', 'partial file') to the process's stderr, from C and without a video
-id. A wrong byte in a source makes such lines (2026-10-06: the Storage disk runs at 60-66 C and a
-read returns a wrong byte now and then), so they must name their video. Each GPU worker therefore
+id. A damaged source, or a bad read of it, makes such lines, so they must name their video. Each GPU worker therefore
 points its file descriptor 2 at a file of its own, <out_root>/.state/logs/decode_gpu<N>_<stamp>.log
 (DecodeLog; N = the physical GPU, stamp = the worker's start, so a respawned worker starts a new
 file), and writes a marker line around each video its reader decodes and when it commits one:
@@ -15,13 +14,14 @@ file), and writes a marker line around each video its reader decodes and when it
 A line between a video's BEGIN and END was printed while the reader decoded it. Python's
 sys.stderr is pointed at the old stderr, so the worker's warnings and tracebacks stay in the
 extract's own output, but other C code of the worker can still write to fd 2 during a decode
-(TensorRT, CUDA, OpenCV in the crop threads, a crash message: these now land in the decode log).
-So decoder_errors() keeps only the decoder's own lines: libav's, which carry its context prefix
-'[<component> @ 0x<address>]' (e.g. '[h264 @ 0x55d0c2a3c4c0] error while decoding MB 6 2'), and
-OpenCV's videoio warnings; printed_lines() returns every line. libav's repeat counter ('Last
-message repeated N times') is dropped: it is printed at the next message, which may come after
-the END. `check` reports the videos whose committed decode printed decoder errors, unless their
-dataset declares the source damaged (datasets.Video.known_damage), and logs other lines as info.
+(TensorRT, CUDA, OpenCV in the crop threads, a crash message: these land in the decode log too).
+printed_lines() returns every line of each video's committed decode, and is_decoder_line() tells
+the decoder's own lines: libav's, which carry its context prefix '[<component> @ 0x<address>]'
+(e.g. '[h264 @ 0x55d0c2a3c4c0] error while decoding MB 6 2'), and OpenCV's videoio warnings.
+libav's repeat counter ('Last message repeated N times') is dropped: it is printed at the next
+message, which may come after the END. `check` reports the videos whose committed decode printed
+decoder errors, unless their dataset declares the source damaged (datasets.Video.known_damage),
+and logs other lines as info.
 The worker's results never depend on any of this.
 
 Standard library only (the worker imports it before torch; `check` imports no torch for it).
@@ -126,27 +126,15 @@ class DecodeLog:
             self._ours = self._python = None
 
 
-def decoder_errors(out_root: Path, committed_only: bool = True) -> Dict[str, List[str]]:
-    """{video_id: the decoder's lines (is_decoder_line) printed while the video was decoded} from
-    the decode logs of `out_root`, for the last decode of each video that its worker then
-    committed (the decode behind the outputs), or with committed_only=False for the last decode of
-    each video, committed or not. Videos whose decode printed no decoder line are left out."""
-    out: Dict[str, List[str]] = {}
-    for vid, lines in printed_lines(out_root, committed_only).items():
-        errors = [line for line in lines if is_decoder_line(line)]
-        if errors:
-            out[vid] = errors
-    return out
-
-
-def printed_lines(out_root: Path, committed_only: bool = True) -> Dict[str, List[str]]:
-    """Like decoder_errors, with every line written to the worker's fd 2 during the decode (the
-    decoder's and any other C code's). The logs are read in the order of their start stamps, so a
-    later run's decode replaces an earlier one."""
+def printed_lines(out_root: Path) -> Dict[str, List[str]]:
+    """{video_id: every line written to the worker's fd 2 (the decoder's and any other C code's)
+    while the video was decoded} from the decode logs of `out_root`, for the last decode of each
+    video that its worker then committed (the decode behind the outputs). Videos whose decode
+    printed nothing are left out. The logs are read in the order of their start stamps, so a later
+    run's decode replaces an earlier one."""
     out: Dict[str, List[str]] = {}
     for path in _logs(out_root):
-        decoded, committed = _read(path)
-        for vid, lines in (committed if committed_only else decoded).items():
+        for vid, lines in _committed_lines(path).items():
             if lines:
                 out[vid] = lines
             else:
@@ -176,10 +164,10 @@ def _logs(out_root: Path) -> List[Path]:
     return [path for _, _, path in sorted(found)]
 
 
-def _read(path: Path) -> Tuple[Dict[str, List[str]], Dict[str, List[str]]]:
-    """({video: lines of its last decode in this log}, {video: lines of the decode it committed}).
-    A COMMIT can come before its decode's END (the worker commits while the reader closes the
-    decoder); it then applies at that END."""
+def _committed_lines(path: Path) -> Dict[str, List[str]]:
+    """{video: the lines of its decode in this log that the worker committed}. A COMMIT can come
+    before its decode's END (the worker commits while the reader closes the decoder); it then
+    applies at that END, and one after the END applies to the video's last decode."""
     decoded: Dict[str, List[str]] = {}
     committed: Dict[str, List[str]] = {}
     current: Optional[str] = None
@@ -215,4 +203,4 @@ def _read(path: Path) -> Tuple[Dict[str, List[str]], Dict[str, List[str]]]:
                 committed[vid] = decoded[vid]
     if current is not None:
         finish()
-    return decoded, committed
+    return committed

@@ -6,13 +6,13 @@
 #   1. checks Linux x86_64, glibc >= 2.28, ffmpeg with libx264, ffprobe
 #   2. creates the venv from that Python: $PYTHON, else pythonX.Y on PATH, else uv's (installed with
 #      `uv python install --no-bin X.Y` when uv is on PATH and has none; $UV_PYTHON_INSTALL_DIR is respected)
-#   3. installs requirements.txt (3.11, newest stack) or requirements-py38.txt (3.8, the BOBSL machine):
-#      exact versions, every file hash-checked, 6.9 GB of downloads (5.7 GB for 3.8). mmpose is the
-#      PyPI wheel, except in a checkout with its own ./mmpose source tree (gitignored, so never in a
-#      fresh clone; the BOBSL machine has one): that tree is linked into the venv instead, as
-#      slp_pose.env requires then.
+#   3. installs requirements.txt (3.11, newest stack) or requirements-py38.txt (3.8, the extraction
+#      environment of the built-in datasets): exact versions, every file hash-checked, 6.9 GB of
+#      downloads (5.7 GB for 3.8). mmpose is the PyPI wheel, except in a checkout with its own ./mmpose
+#      source tree (gitignored, so never in a fresh clone): that tree is linked into the venv instead,
+#      as slp_pose.env requires then.
 #   4. deletes TensorRT's Windows-only builder resources (1.8 GB in 10.13, 2.9 GB in 10.16; they serve
-#      engines built for Windows only); `import tensorrt` comes from the tensorrt-cu12 sdist, no shim
+#      engines built for Windows only); `import tensorrt` comes from the tensorrt-cu12 sdist
 #   5. installs this checkout editable with its [trt] extra (`slp-pose` command)
 #   6. pip check + scripts/check_env.py (imports, versions, ffmpeg, CUDA code for every GPU, GPU kernels)
 # No CUDA toolkit is needed on any GPU, H100 (compute capability 9.0) included: the prebuilt mmcv's CUDA
@@ -146,8 +146,8 @@ then
         # --no-index: every requirement of slp-pose[trt] must already be installed from the lock file.
         pip_q install --no-index --no-build-isolation -e "$REPO[trt]"
     else
-        # An editable pyproject build needs setuptools >= 64, newer than requirements-py38.txt's (the BOBSL
-        # venv's): pip builds it in isolation with a current setuptools; pip check covers the requirements.
+        # An editable pyproject build needs setuptools >= 64, newer than requirements-py38.txt's: pip
+        # builds it in isolation with a current setuptools; pip check covers the requirements.
         pip_q install --no-deps -e "$REPO"
     fi
 fi

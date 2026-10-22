@@ -1,4 +1,4 @@
-"""Pose pre/post-processing (spec §4.2 posepost.py): what mmpose does around the network.
+"""Pose pre/post-processing: what mmpose does around the network.
 
 Per engine call: upload uint8 BGR crops, BGR->RGB + ImageNet mean/std on the GPU (mmengine
 ImgDataPreprocessor order), append the mirrored batch (`inputs.flip(-1)`), run the engine once

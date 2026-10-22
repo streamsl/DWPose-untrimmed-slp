@@ -3,7 +3,7 @@
 Conventions used everywhere:
 - Frame indices are 0-based positions in the decoded video (every frame, native fps).
 - Boxes are xyxy float32 in ORIGINAL-frame pixels.
-- Keypoints use the saved encoding (spec §4.1): (x/W, y/H, raw SimCC score) float32 in
+- Keypoints use the saved encoding: (x/W, y/H, raw SimCC score) float32 in
   COCO-WholeBody-133 order.
 - Ragged per-frame lists are CSR: `offsets` has length F+1, rows of frame t are
   `offsets[t]:offsets[t+1]`, offsets[0] == 0.
@@ -24,7 +24,7 @@ if TYPE_CHECKING:
 SCHEMA_VERSION = 1
 NUM_KEYPOINTS = 133
 
-# det_flags bits (spec §4.1)
+# det_flags bits
 POSE_SET = 1   # survives the pose-set rule (score > 0.3, mmpose legacy NMS 0.3)
 COUNT_SET = 2  # survives the count-set rule (score > 0.3, torchvision NMS 0.45)
 POSED = 4      # was posed (at most K per frame, always a subset of POSE_SET)
@@ -32,12 +32,8 @@ POSED = 4      # was posed (at most K per frame, always a subset of POSE_SET)
 
 @dataclass(frozen=True)
 class VideoInfo:
-    """What ffprobe says about one video (spec §4.1: T = nb_frames), and the frame count the dataset
-    expects instead when the container's nb_frames is wrong (D28).
-
-    Picklable into a respawned worker of an older parent: fields are only ever added at the end with
-    a plain default (an older pickle then reads the class default; tests/test_pickle_compat.py).
-    """
+    """What ffprobe says about one video (T = nb_frames), and the frame count the dataset expects
+    instead when the container's nb_frames is wrong."""
 
     path: Path
     video_id: str
@@ -48,7 +44,7 @@ class VideoInfo:
     nb_frames: int
     codec: str
     size_bytes: int
-    # datasets.Video.expected_frames (D28): the frames the file really decodes to when ffprobe's
+    # datasets.Video.expected_frames: the frames the file really decodes to when ffprobe's
     # nb_frames is wrong (a source truncated in its official archive); None = nb_frames. Not hashed.
     expected_frames: Optional[int] = None
 
@@ -107,7 +103,7 @@ def _check_offsets(offsets: np.ndarray, n: int, what: str) -> None:
 
 @dataclass
 class ChunkDets:
-    """Per-frame person candidates of a chunk (CSR), spec §4.1 `det_*`.
+    """Per-frame person candidates of a chunk (CSR): the persons record's `det_*` members.
 
     Rows of one frame are in descending score order (the head NMS output order). Candidates are
     person detections with score > cand_score_thr after the head's class-aware NMS 0.65.
@@ -143,7 +139,7 @@ class ChunkDets:
         return np.bincount(self.frame_of_row()[has], minlength=self.num_frames).astype(np.int64)
 
     def num_persons(self) -> np.ndarray:
-        """(F,) uint8 size of the count set per frame (spec §4.1 `num_persons`)."""
+        """(F,) uint8 size of the count set per frame (the persons record's `num_persons`)."""
         counts = self.count_per_frame(COUNT_SET)
         if counts.size and counts.max() > 255:
             raise ValueError('more than 255 people in the count set of one frame')
@@ -171,7 +167,7 @@ class ChunkDets:
 
 @dataclass
 class ChunkPoses:
-    """Keypoints of the posed people of a chunk (CSR), spec §4.1 `kpt_*`.
+    """Keypoints of the posed people of a chunk (CSR): the persons record's `kpt_*` members.
 
     Invariant: the kpt rows of frame t are exactly the POSED det rows of frame t, in ascending
     det-row order (i.e. descending detector score). `primary[t]` is the position of the primary

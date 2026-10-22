@@ -1,10 +1,10 @@
-"""Detector post-processing (spec §4.2 detpost.py, D8, D10).
+"""Detector post-processing.
 
 Reproduces `YOLOXHead.predict_by_feat(rescale=True)` restricted to the person class, batched on
-the GPU, then splits the result into the three box sets of spec §4.1:
+the GPU, then splits the result into the three box sets of the persons record (det_flags):
 - candidates: person, score > cand_score_thr, after the head's class-aware NMS 0.65 (mmcv's CUDA nms,
   per frame, exactly as mmdet's batched_nms sees the person boxes; on a GPU that mmcv's prebuilt
-  kernels do not cover, e.g. an H100, the same computation bit for bit in torch, `head_nms`, D27);
+  kernels do not cover, e.g. an H100, the same computation bit for bit in torch, `head_nms`);
 - pose set (POSE_SET): candidates with score > pose_score_thr after mmpose's numpy `nms`
   (legacy +1 IoU), the DWPose reference rule;
 - count set (COUNT_SET): candidates with score > count_score_thr after torchvision `nms` on the CPU

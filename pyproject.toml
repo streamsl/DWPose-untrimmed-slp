@@ -1,22 +1,7 @@
-# slp-pose: DWPose whole-body keypoints for untrimmed sign-language videos.
-#
-# The tested, exact environments are requirements.txt (Python 3.11, newest stack) and requirements-py38.txt
-# (the BOBSL machine); scripts/setup_env.sh builds one from a fresh clone. The ranges below admit both.
-# A manual install without the lock files, into a Python 3.11 venv, takes torch from the PyTorch index,
-# mmcv from the OpenMMLab wheels (PyPI has only an sdist that compiles for 20+ minutes) and TensorRT from
-# pypi.nvidia.com (PyPI's tensorrt-cu12-libs is a stub that downloads it at build time). mmpose requires
-# chumpy (never imported), an sdist whose setup.py imports pip, so it is built without build isolation:
-#   pip install -U pip 'setuptools<82'
-#   pip install 'numpy<2' torch==2.1.2 torchvision==0.16.2 \
-#       --extra-index-url https://download.pytorch.org/whl/cu121
-#   pip install --no-build-isolation chumpy==0.70
-#   pip install './DWPose-untrimmed-slp[trt]' --extra-index-url https://pypi.nvidia.com \
-#       -f https://download.openmmlab.com/mmcv/dist/cu121/torch2.1/index.html
-#
-# Dataset plugins: a package can provide datasets through the entry-point group "slp_pose.datasets"
-# (name = dataset name, value = a Dataset subclass or a module defining one), e.g. in its pyproject.toml:
-#   [project.entry-points."slp_pose.datasets"]
-#   my_data = "my_package.my_data:MyData"
+# slp-pose: DWPose whole-body keypoints for untrimmed sign-language videos. The tested, exact environments
+# are requirements.txt (Python 3.11) and requirements-py38.txt (Python 3.8), which scripts/setup_env.sh
+# installs; the ranges below admit both. README.md ('Installation') gives the pip-only route, and
+# 'Adding a dataset' how a package provides datasets through the entry-point group "slp_pose.datasets".
 
 [build-system]
 requires = ["setuptools>=64", "wheel"]

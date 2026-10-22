@@ -148,7 +148,7 @@ def version_problems(requirements: Path) -> List[str]:
         have = _installed(name)
         if have is None and name == 'tensorrt-cu12' and _installed('tensorrt-cu12-bindings') == want:
             # The tensorrt-cu12 sdist installs only tensorrt/__init__.py, two lines re-exporting
-            # tensorrt_bindings; the BOBSL .venv has them as a local module instead. The slp_pose
+            # tensorrt_bindings; a venv may provide them as a local module instead. The slp_pose
             # start-up checks import it and compare its version.
             print(f'  tensorrt-cu12 not installed: `import tensorrt` must re-export tensorrt_bindings {want}')
         elif have is None:

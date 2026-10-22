@@ -1,4 +1,4 @@
-"""A dataset with signer rules of its own (spec D22): every .mp4 under <data root>/left_signer/videos/,
+"""A dataset with signer rules of its own: every .mp4 under <data root>/left_signer/videos/,
 whose interpreter stands at the LEFT of the frame, beside a presenter who may be larger.
 
     slp-pose list-videos --dataset examples/custom_rules.py --data-root /path/to/data --list
@@ -10,10 +10,10 @@ signer_track):
 - `left_largest` (per frame, a FrameRule; the GPU workers pose with it): the largest box whose
   centre lies in the left 40 % of the frame, else the largest box, so the interpreter is posed;
 - `signer_track_left` (video level, a VideoRule; the parent derives it on the CPU after each
-  commit): the framework's signer_track (spots of IoU-linked tracks, D14, with D24's spot identity:
-  box size, shoulder width and anchors; it reads the shoulder keypoints) with a left position
-  prior, built with signer.track_rule. SignerTrackParams(prior='left', fit_iou=0, fit_scale=0,
-  max_scale=0, min_scale=0) would give D14's box-only spots, which read no keypoints.
+  commit): the framework's signer_track (spots of IoU-linked tracks, identified by box size,
+  shoulder width and anchors; it reads the shoulder keypoints) with a left position prior, built
+  with signer.track_rule. SignerTrackParams(prior='left', fit_iou=0, fit_scale=0, max_scale=0,
+  min_scale=0) gives box-only spots, which read no keypoints.
 Their names and params are hashed: changing `left_largest` re-extracts the committed videos,
 changing `signer_track_left` re-derives them on the CPU. Change the params, or the name, whenever
 the code of a rule changes. slp_pose/datasets/auslan_news.py is a larger example (a video-level
