@@ -118,10 +118,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument('--no-persons', dest='persons', action='store_false',
                    help='draw the primary signer only (default: every person and candidate box)')
 
-    p = command('subs', "write misaligned-slt's subs/<vid>.<track>.vtt and video_meta.csv caption_source")
+    p = command('subs', "write misaligned-slt's subs/<vid>.<track>.vtt, the split files and the video_meta files")
     _out_root_option(p)
 
     p = command('splits', "write the dataset's split files (video_id, split) for misaligned-slt")
+    _out_root_option(p)
+
+    p = command('meta', 'rewrite the video_meta files from the output root, without reading persons/ or poses/')
     _out_root_option(p)
     return parser
 
@@ -321,20 +324,22 @@ def _subs(args: argparse.Namespace) -> int:
     _setup_logging(root, 'subs')
     from .datasets import index_table
     from .run import VIDEO_INDEX, merge_meta, root_lock, write_video_index
-    from .subs import write_subs
+    from .subs import write_meta_files, write_splits, write_subs
     videos = load_videos(dataset)
     try:
         with root_lock(root):
             write_video_index(root / VIDEO_INDEX, *index_table(videos, dataset.data_root))   # current splits
             summary = write_subs(dataset, root, videos)
+            _log_splits(root, write_splits(dataset, root, videos))   # the video_meta files list their videos
             merge_meta(root)
+            counts = write_meta_files(dataset, root, summary.changed)
     except RuntimeError as exc:   # the root is locked by a running extract or derive
         log.error('%s', exc)
         return 1
     log.info('%s: %d committed videos, %d with subtitles; %d files written, %d unchanged, %d removed; '
              'cues per track %s, dropped %s', dataset.name, summary.videos, summary.captioned,
              summary.files_written, summary.files_unchanged, summary.files_removed, summary.cues, summary.dropped)
-    return 0
+    return _spans_known(root, counts)
 
 
 def _splits(args: argparse.Namespace) -> int:
@@ -342,15 +347,51 @@ def _splits(args: argparse.Namespace) -> int:
     root = _out_root(args, dataset)
     _setup_logging(None, 'splits')
     from .subs import write_splits
-    for file_name, splits in write_splits(dataset, root).items():
+    _log_splits(root, write_splits(dataset, root))
+    if not (root / 'video_meta.csv').is_file():   # nothing committed yet
+        return 0
+    return _meta_files(dataset, root)   # the video_meta files list the videos of the split files
+
+
+def _meta(args: argparse.Namespace) -> int:
+    dataset = _dataset(args)
+    root = _out_root(args, dataset)
+    _setup_logging(root, 'meta')
+    return _meta_files(dataset, root)
+
+
+def _meta_files(dataset: Dataset, root: Path) -> int:
+    from .run import root_lock
+    from .subs import write_meta_files
+    try:
+        with root_lock(root):
+            counts = write_meta_files(dataset, root)
+    except RuntimeError as exc:   # the root is locked by a running extract or derive
+        log.error('%s', exc)
+        return 1
+    return _spans_known(root, counts)
+
+
+def _spans_known(root: Path, counts: Dict[str, Dict[str, int]]) -> int:
+    """Exit code of a command that wrote the video_meta files: 1 while a file holds a blank (unknown) unreliable_spans cell, because
+    misaligned-slt reads a blank cell as no span (a SignVerse corpus writes []), so its loader would read those videos' dropped
+    cues as gaps; the WARNING above names the missing sources."""
+    unknown = {name: c['unknown_spans'] for name, c in counts.items() if c['unknown_spans']}
+    for name, n in unknown.items():
+        log.error('%s: unreliable_spans is unknown for %d videos; put their sources in place and run `slp-pose meta` again',
+                  root / name, n)
+    return 1 if unknown else 0
+
+
+def _log_splits(root: Path, counts: Dict[str, Dict[str, int]]) -> None:
+    for file_name, splits in counts.items():
         log.info('%s: %s', root / file_name, ', '.join(f'{split} {n}' for split, n in sorted(splits.items())))
-    return 0
 
 
 _COMMANDS: Dict[str, Callable[[argparse.Namespace], int]] = {
     'fetch-models': _fetch_models, 'build-engines': _build_engines, 'list-videos': _list_videos,
     'parity': _parity, 'extract': _extract, 'derive': _derive, 'check': _check, 'render': _render,
-    'render-done': _render_done, 'subs': _subs, 'splits': _splits,
+    'render-done': _render_done, 'subs': _subs, 'splits': _splits, 'meta': _meta,
 }
 
 

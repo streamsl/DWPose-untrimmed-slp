@@ -23,6 +23,13 @@ The manual files tag cues whose signing does not match the subtitle ([SUB-DOES-N
 text as a translation target). The automatic files carry no tags. The original broadcast subtitles
 (original_data/subtitles/audio-aligned/, timed to the speech) are not used.
 
+Metadata (Dataset.split_tracks, subs.write_meta_files): video_meta.csv goes with splits_automatic.csv
+and 'en', video_meta_manual.csv with splits_manual.csv and 'en-manual'. Their unreliable_spans
+(Bobsl.unreliable_spans): for 'en-manual', the span of every dropped tagged cue, read from the
+original manual files (subs/ no longer holds them; without those files the column is unknown); for
+'en', none ([]): the automatic files carry no tags, and misaligned-slt itself marks the gap around a
+collapsed alignment (a cue shorter than its subtitles.min_duration_s), as in every corpus.
+
 Episode 5976836975695491321 is damaged in the official v1.4 archive (two 1 MiB runs of zero bytes;
 decoders stop at frame 71,837 of 90,577). The outputs were extracted from a repaired copy put in place
 of the original file: the same 90,577 frames, with the 1,287 frames that depend on the damaged data
@@ -36,7 +43,7 @@ import json
 import re
 from fractions import Fraction
 from pathlib import Path
-from typing import Dict, List, Sequence
+from typing import Dict, List, Sequence, Tuple
 
 from ..signer import SignerTrackParams, track_rule
 from ..subs import Cue, read_vtt
@@ -94,6 +101,7 @@ class Bobsl(Dataset):
     extraction_rule = 'largest_bbox'
     rules = (SIGNER_TRACK_BOBSL,)
     split_order = ('val', 'test', 'train', 'challenge_test')
+    split_tracks = (('automatic', 'en'), ('manual', 'en-manual'))
 
     @property
     def source(self) -> Path:
@@ -129,6 +137,14 @@ class Bobsl(Dataset):
         if manual.is_file():
             tracks['en-manual'] = [cue for cue in read_vtt(manual) if not QUALITY_TAG.search(cue.text)]
         return tracks
+
+    def unreliable_spans(self, video_id: str, track: str, cues: Sequence[Cue]) -> List[Tuple[Fraction, Fraction]]:
+        """'en-manual': the span of every cue that `captions` drops for its tag, from the original
+        manual file (FileNotFoundError without it: unknown); 'en': none (module docstring)."""
+        if track == 'en-manual':
+            manual = self.data_root / 'BOBSL' / MANUAL_SUBTITLES / f'{video_id}.vtt'
+            return [(cue.start, cue.end) for cue in read_vtt(manual) if QUALITY_TAG.search(cue.text)]
+        return []
 
     def _official_splits(self) -> Dict[str, str]:
         """{episode id: official split}; an episode listed twice keeps its first split in split_order."""

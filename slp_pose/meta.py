@@ -2,8 +2,7 @@
 
 CPU only, no torch.
 
-The CSV is misaligned-slt's poses/pose_io.py contract: header META_FIELDS, bytes equal to its
-`save_video_meta`. A meta row is a plain dict with exactly the keys of META_FIELDS, in that order:
+A meta row is a plain dict with exactly these keys, in this order:
   video_id str; duration_s float = T * den / num (exact rational fps); width int; height int
   (original frame size); caption_source None (run.merge_meta fills it from .state/captions.json
   once `slp-pose subs` has run);
@@ -33,6 +32,18 @@ A GPU worker's commit holds the whole-frame row of its per-frame extraction rule
 `derive` replaces it with the row of the dataset's primary rule. The row is stored as JSON
 (json.dumps(allow_nan=True), NaN token) in `<root>/.state/meta/<vid>.json` and in the `meta` member
 of persons/<vid>.npz.
+
+The CSV (video_meta.csv, and one video_meta_<name>.csv per other split file: subs.write_meta_files)
+is misaligned-slt's poses/pose_io.py contract: header META_FIELDS, bytes equal to its
+`save_video_meta`. Its columns:
+  the meta row's (csv_row), without masked_runs: misaligned-slt does not read it (it stays in the
+    meta row, inside the record);
+  switch_runs, default_signing_runs: always []. They mark misaligned-slt's own signer switch, which
+    never runs on these outputs (the dataset's signer rule picks the signer), so no unit is in doubt;
+  copy_of: written by misaligned-slt's copy check; slp-pose never computes it and keeps it;
+  unreliable_spans: [start_s, end_s] spans in seconds where the file's subtitle track does not hold
+    the signing (Dataset.unreliable_spans; merge_spans); [] = checked, none; blank = unknown;
+  any column that META_FIELDS does not name: kept, after them (rewrite_video_meta).
 """
 from __future__ import annotations
 
@@ -42,16 +53,22 @@ import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Mapping, Optional, Tuple
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
-# Byte-for-byte misaligned-slt poses/pose_io.py::META_FIELDS (RUN_FIELDS last).
-RUN_FIELDS = ('masked_runs', 'empty_runs', 'handless_runs')
-META_FIELDS = ('video_id', 'duration_s', 'width', 'height', 'caption_source', 'undetected_ratio') + RUN_FIELDS
+# Byte-for-byte misaligned-slt poses/pose_io.py RUN_FIELDS, JSON_FIELDS and META_FIELDS (the CSV header).
+RUN_FIELDS = ('empty_runs', 'handless_runs', 'switch_runs', 'default_signing_runs')
+JSON_FIELDS = RUN_FIELDS + ('copy_of', 'unreliable_spans')
+META_FIELDS = ('video_id', 'duration_s', 'width', 'height', 'caption_source', 'undetected_ratio') + JSON_FIELDS
+RETIRED_FIELDS = ('masked_runs',)   # columns of older files that misaligned-slt does not read: dropped on reading
+# The CSV columns that a meta row gives (csv_row); switch_runs and default_signing_runs are always [].
+ROW_COLUMNS = ('video_id', 'duration_s', 'width', 'height', 'caption_source', 'undetected_ratio', 'empty_runs',
+               'handless_runs')
 # Version of the meta definitions: stored as provenance['meta_version'] by `derive` and hashed into
 # every rule's derivation_hash (record.py); a GPU worker's commit has none. Bump META_VERSION whenever a
-# definition below changes.
+# definition below changes. The CSV columns are not stored in the record, so a change of them alone needs
+# no bump (`slp-pose meta` rewrites the files).
 META_VERSION = 5
 # The misaligned-slt commit whose prepare_yt25.py run definitions this module follows; `derive` stores
 # it as provenance['mslt_commit'].
@@ -374,21 +391,43 @@ def _cell(value: object) -> str:
 
 
 def csv_cells(row: Mapping[str, object]) -> List[str]:
-    """The 9 CSV cells of a row, formatted exactly like misaligned-slt `save_video_meta`:
-    duration_s via str(float) (== repr), width/height as int ('' if None), caption_source '' if
-    None, undetected_ratio f'{x:.4f}', each run column json.dumps(list).
+    """The META_FIELDS cells of a row, formatted exactly like misaligned-slt `save_video_meta`:
+    duration_s via str(float) (== repr), width/height as int, caption_source as text,
+    undetected_ratio f'{x:.4f}', each JSON column json.dumps; '' for None or a missing key.
     """
     ratio = row.get('undetected_ratio')
     return [str(row['video_id']), _cell(row.get('duration_s')), _cell(row.get('width')), _cell(row.get('height')),
             str(row.get('caption_source') or ''), '' if ratio is None else f'{float(ratio):.4f}',
-            *(json.dumps(row[key]) for key in RUN_FIELDS)]
+            *('' if row.get(key) is None else json.dumps(row[key]) for key in JSON_FIELDS)]
 
 
-def write_video_meta(path: Path, rows: Mapping[str, Mapping[str, object]]) -> None:
-    """Write `<root>/video_meta.csv` atomically (tmp file + fsync + os.replace).
+def csv_row(row: Mapping[str, object]) -> Dict[str, object]:
+    """The CSV columns that a video's meta row gives (`row`: a meta row, or a row of read_video_meta):
+    ROW_COLUMNS, and switch_runs and default_signing_runs = [] (module docstring). The other columns
+    are not in it, so rewrite_video_meta keeps them."""
+    return dict({key: row.get(key) for key in ROW_COLUMNS}, switch_runs=[], default_signing_runs=[])
 
-    Output bytes equal misaligned-slt `save_video_meta(path, rows)`: csv.writer, header
-    META_FIELDS, rows sorted by video_id, '\\r\\n' line ends, utf-8. Only the parent process calls this.
+
+def merge_spans(spans: Iterable[Tuple[object, object]]) -> List[List[float]]:
+    """unreliable_spans as misaligned-slt reads it: [start_s, end_s] float seconds, sorted, with
+    spans that overlap or touch merged and empty ones (end <= start) left out."""
+    out: List[List[float]] = []
+    for start, end in sorted((float(a), float(b)) for a, b in spans):
+        if end <= start:
+            continue
+        if out and start <= out[-1][1]:
+            out[-1][1] = max(out[-1][1], end)
+        else:
+            out.append([start, end])
+    return out
+
+
+def write_video_meta(path: Path, rows: Mapping[str, Mapping[str, object]], extra: Sequence[str] = ()) -> None:
+    """Write a video_meta CSV atomically (tmp file + fsync + os.replace): header META_FIELDS and then
+    the `extra` columns (each row's text there, '' where it has none), rows sorted by video_id.
+
+    Without extra columns the bytes equal misaligned-slt `save_video_meta(path, rows)`: csv.writer,
+    '\\r\\n' line ends, utf-8. Only the parent process calls this.
     """
     path = Path(path)
     lines = []
@@ -396,15 +435,58 @@ def write_video_meta(path: Path, rows: Mapping[str, Mapping[str, object]]) -> No
         # save_video_meta writes the dict key as the id; a row must agree with its key.
         if rows[video_id].get('video_id') != video_id:
             raise ValueError(f'meta row keyed {video_id!r} has video_id {rows[video_id].get("video_id")!r}')
-        lines.append(csv_cells(rows[video_id]))
+        lines.append(csv_cells(rows[video_id]) + [str(rows[video_id].get(key) or '') for key in extra])
     tmp = path.with_name(path.name + '.tmp')
     with open(tmp, 'w', encoding='utf-8', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(META_FIELDS)
+        writer.writerow(META_FIELDS + tuple(extra))
         writer.writerows(lines)
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, path)
+
+
+def rewrite_video_meta(path: Path, rows: Mapping[str, Mapping[str, object]]) -> None:
+    """write_video_meta of `rows` that keeps what slp-pose does not compute: a column that a row lacks
+    (copy_of, which misaligned-slt's copy check writes; unreliable_spans where it is unknown here; a
+    column that META_FIELDS does not name) takes the value of the same video's row in the file at
+    `path`, and is blank for a video the file does not list. The file then lists exactly `rows`."""
+    old, extra = read_video_meta(path)
+    write_video_meta(path, {vid: dict(old.get(vid, {}), **row) for vid, row in rows.items()}, extra)
+
+
+def read_video_meta(path: Path) -> Tuple[Dict[str, Dict[str, object]], List[str]]:
+    """({video_id: row}, extra columns) of a video_meta CSV of any version, written by slp-pose or by
+    misaligned-slt; ({}, []) when there is no file. A row holds every cell of its line: the
+    META_FIELDS ones as the values that csv_cells writes back to the same text (None for a blank
+    cell), any other as its text. extra: the file's columns outside META_FIELDS, in file order.
+    RETIRED_FIELDS are left out of both."""
+    path = Path(path)
+    if not path.is_file():
+        return {}, []
+    with open(path, encoding='utf-8', newline='') as f:
+        reader = csv.DictReader(f)
+        extra = [key for key in reader.fieldnames or () if key not in META_FIELDS + RETIRED_FIELDS]
+        rows = {}
+        for line in reader:
+            row = {key: _value(key, text or '') for key, text in line.items()
+                   if key is not None and key not in RETIRED_FIELDS}
+            if row.get('video_id'):
+                rows[row['video_id']] = row
+    return rows, extra
+
+
+def _value(key: str, text: str) -> object:
+    """One cell of a video_meta CSV as read_video_meta gives it."""
+    if key == 'video_id' or key not in META_FIELDS:
+        return text
+    if not text:
+        return None
+    if key in JSON_FIELDS:
+        return json.loads(text)
+    if key in ('width', 'height'):
+        return int(float(text))
+    return float(text) if key in ('duration_s', 'undetected_ratio') else text
 
 
 def load_meta_rows(state_meta_dir: Path) -> Dict[str, Dict[str, object]]:

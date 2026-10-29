@@ -237,16 +237,21 @@ def write_video_index(path: Path, header: Sequence[str], rows: Sequence[Dict[str
 
 
 def merge_meta(out_root: Path) -> Path:
-    """Write <out_root>/video_meta.csv from .state/meta/*.json (meta.load_meta_rows +
-    meta.write_video_meta); returns the CSV path. Only rows of videos with a done marker; their
-    caption_source comes from .state/captions.json when `slp-pose subs` wrote one."""
+    """Write the meta row columns (meta.csv_row of .state/meta/*.json) of <out_root>/video_meta.csv,
+    one row per video with a done marker, and of every video_meta_<name>.csv there, for the videos it
+    lists (subs.write_meta_files chooses them); returns the video_meta.csv path. caption_source comes
+    from .state/captions.json when `slp-pose subs` wrote one. Every other column (copy_of,
+    unreliable_spans, columns slp-pose does not know) keeps its value (meta.rewrite_video_meta)."""
     from . import meta, subs
     layout = record.OutputLayout(Path(out_root))
     rows = meta.load_meta_rows(layout.meta_json('*').parent)
     done = set(committed_videos(out_root))
-    rows = subs.caption_source_rows({vid: row for vid, row in rows.items() if vid in done},
+    rows = subs.caption_source_rows({vid: meta.csv_row(row) for vid, row in rows.items() if vid in done},
                                     subs.load_caption_sources(Path(out_root)))
-    meta.write_video_meta(layout.video_meta_csv, rows)
+    meta.rewrite_video_meta(layout.video_meta_csv, rows)
+    for path in sorted(Path(out_root).glob('video_meta_*.csv')):
+        listed, _ = meta.read_video_meta(path)
+        meta.rewrite_video_meta(path, {vid: row for vid, row in rows.items() if vid in listed})
     return layout.video_meta_csv
 
 

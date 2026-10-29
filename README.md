@@ -28,8 +28,7 @@ scripts/setup_env.sh                                    # builds .venv (Python 3
 .venv/bin/slp-pose list-videos --dataset auslan_news    # checks the dataset under ./data
 .venv/bin/slp-pose extract --dataset auslan_news        # on GPUs 0,1; --gpus 0 for one GPU
 .venv/bin/slp-pose check --dataset auslan_news          # verifies the outputs
-.venv/bin/slp-pose subs --dataset auslan_news           # subtitles for misaligned-slt
-.venv/bin/slp-pose splits --dataset auslan_news         # split file for misaligned-slt
+.venv/bin/slp-pose subs --dataset auslan_news           # subtitles, split file and video_meta.csv for misaligned-slt
 ```
 
 A clone holds no data: put the videos under `./data` as in [section 6](#data-layout), or pass
@@ -54,6 +53,7 @@ For each frame, at the video's native frame rate and resolution:
   poses/<video_id>.npy         the signer, per frame
   persons/<video_id>.npz       the raw record: every candidate and posed person
   video_meta.csv               one row per committed video
+  video_meta_<name>.csv        the same for the videos of another split file (BOBSL: video_meta_manual.csv)
   video_ids.csv                every video of the dataset
   subs/<video_id>.<track>.vtt  subtitles (slp-pose subs)
   splits*.csv                  the dataset's split files (slp-pose splits)
@@ -71,21 +71,36 @@ For each frame, at the video's native frame rate and resolution:
   (`kpt_primary`, -1 = none); the meta row; and the provenance (git sha, hashes, engine and
   checkpoint sha256, library versions, GPU). `poses/` and the meta row are computed from it.
 - **`video_meta.csv`**: the columns
-  `video_id,duration_s,width,height,caption_source,undetected_ratio,masked_runs,empty_runs,handless_runs`,
+  `video_id,duration_s,width,height,caption_source,undetected_ratio,empty_runs,handless_runs,switch_runs,default_signing_runs,copy_of,unreliable_spans`,
   byte-identical to what misaligned-slt's `save_video_meta` writes:
   - `width`, `height`: the original frame size; `duration_s = T * den / num` from the exact frame
     rate, so `T / duration_s` gives the fps back.
   - `caption_source`: `human` for a video with subtitles, `none` without, once `subs` has run.
   - `undetected_ratio`: the share of frames with nobody in the detector's count set.
-  - `masked_runs`: frames where a second real body moves its arms (for BOBSL and Auslan News, only
-    inside the interpreter's region).
   - `empty_runs`: frames whose `poses/` row is not a real body (no signer, or too few joints).
   - `handless_runs`: frames whose `poses/` row shows no hand.
+  - `switch_runs`, `default_signing_runs`: always `[]`. They mark misaligned-slt's own signer switch,
+    which never runs on these outputs (the dataset's signer rule picks the signer).
+  - `copy_of`: written by misaligned-slt's copy check. slp-pose never computes it and keeps it when
+    it rewrites the file (blank for a new video). When `subs` changes the subtitles of the file's
+    track, it blanks it, as misaligned-slt's own subs stage does: then run the copy check again.
+  - `unreliable_spans`: `[start_s, end_s]` spans in seconds where the file's subtitle track does not
+    hold the signing (`[]` = checked, none; blank = unknown). misaligned-slt quarantines every
+    caption unit that overlaps one and reads its frames as unlabelled. Only BOBSL has such spans
+    ([section 6](#6-built-in-datasets)).
+  - Any other column, e.g. one that a newer misaligned-slt writes, is kept after these.
 
   The run columns are JSON lists of half-open `[a, b]` frame runs (`[]` = none), computed like
   misaligned-slt's `prepare_yt25.py` at `meta.MSLT_COMMIT`, at the video's own rate. misaligned-slt
-  cuts masked and empty runs out of the stream and quarantines captions that lie mostly in handless
-  runs. `slp_pose/meta.py` has the exact definitions and constants.
+  cuts empty runs out of the stream and quarantines captions that lie mostly in handless runs.
+  `slp_pose/meta.py` has the exact definitions and constants. `masked_runs` (frames where a second
+  real body moves its arms) is not a column, because misaligned-slt does not read it; it stays in
+  the meta row inside `persons/` and `.state/meta/`.
+- **`video_meta_<name>.csv`**: one file for each split file after the first of the dataset's
+  `split_tracks` ([section 8](#subtitles-and-splits)), each a benchmark of its own. BOBSL has
+  `video_meta_manual.csv` for `splits_manual.csv` and the `en-manual` track: the same columns as
+  `video_meta.csv` for the 55 videos of that split file, with their own `copy_of` and
+  `unreliable_spans`.
 - **`subs/<vid>.<track>.vtt`**: the video's subtitles from the dataset's own annotations, as
   WebVTT. `<track>` is `en` (misaligned-slt's default) or another track such as BOBSL's
   `en-manual`. A video without subtitles has no file.
@@ -179,8 +194,9 @@ version at start-up: 10.16.1.11 on Python 3.11, 10.13.3.9 on 3.8–3.10.
 | [`render`](#render-and-render-done) | draw the keypoints over a window of a video | `--start-s`, `--full`, `--persons` |
 | [`render-done`](#render-and-render-done) | render every committed video in full | `--follow`, `--jobs` |
 | [`parity`](#parity) | compare with the official per-image code | `--videos`, `--gpu`, `--jitter` |
-| [`subs`](#subs-and-splits) | write `subs/` and `caption_source` | |
-| [`splits`](#subs-and-splits) | write the split files | |
+| [`subs`](#subs-splits-and-meta) | write `subs/`, `caption_source`, the split files and the metadata files | |
+| [`splits`](#subs-splits-and-meta) | write the split files | |
+| [`meta`](#subs-splits-and-meta) | rewrite the metadata files without reading `persons/` or `poses/` | |
 
 Common options: `--dataset NAME_OR_FILE` (a built-in or installed name, or a dataset `.py` file;
 default `bobsl`), `--data-root` (default `$SLP_POSE_DATA`, else `./data`), `--out-root` (default
@@ -194,7 +210,7 @@ problems, a failed parity gate, missing models); 2 bad arguments or dataset; 130
   file first. `--videos ID ...` and `--limit N` restrict the run (pass an id that starts with `-`
   as `--videos=<id>`); `--backend torch` uses PyTorch instead of TensorRT (slower).
 - **Commits:** a finished video is committed atomically, then given the final signer rule.
-  `video_meta.csv` is merged at the start, every 50 commits or 30 minutes, and at the end.
+  The metadata files are merged at the start, every 50 commits or 30 minutes, and at the end.
 - **Resume:** run the same command again. Committed videos are skipped; a changed signer rule,
   count-set threshold or meta definition re-derives a video on the CPU; changed engines,
   checkpoints, configs, candidate or pose-set thresholds, backend or extraction rule re-extract it.
@@ -227,8 +243,8 @@ Checks every committed video (or `--videos ID ...`) and exits with 1 when any ha
 ### derive
 
 `slp-pose derive --dataset bobsl --primary-rule signer_track_bobsl` picks the signer again and
-recounts people from `persons/` on the CPU, then rewrites `persons/`, the meta row,
-`video_meta.csv` and `poses/` (only when its rows change). Detections and keypoints stay as they
+recounts people from `persons/` on the CPU, then rewrites `persons/`, the meta row, the metadata
+files and `poses/` (only when its rows change). Detections and keypoints stay as they
 are. `--videos ID ...` limits it; the default is every committed video.
 - A video fails when a per-frame rule picks a person who was never posed (that rule needs a
   re-extraction) or when its `persons/` fails the CRC check (delete `.state/done/<vid>.json` and
@@ -266,16 +282,35 @@ finished report again without a GPU:
 python -c "from slp_pose import parity; r = parity.load_report('REPORT_DIR/parity_trt.json'); print(parity.gate(r)); parity.write_report(r, 'OUT_DIR')"
 ```
 
-### subs and splits
+### subs, splits and meta
 
 `subs` writes each committed video's subtitles to `subs/<vid>.<track>.vtt`, deletes `.vtt` files no
-video produces any more, fills `caption_source` in `video_meta.csv` and rewrites `video_ids.csv`.
-Cues with an empty text, or whose end is not after their start, are dropped and counted in the log.
-It takes the output root's lock. Run it again after the annotations or videos change.
+video produces any more, fills `caption_source` and rewrites `video_ids.csv`, then writes the split
+files and the metadata files as `splits` and `meta` do. Cues with an empty text, or whose end is not
+after their start, are dropped and counted in the log. It takes the output root's lock. Run it
+again after the annotations or videos change.
 
 `splits` writes the dataset's split files into its output root, each a CSV `video_id,split`:
 `splits.csv`, or one `splits_<name>.csv` per split the dataset declares (BOBSL:
-`splits_automatic.csv` and `splits_manual.csv`), and removes other `splits*.csv` files there.
+`splits_automatic.csv` and `splits_manual.csv`), and removes other `splits*.csv` files there. When
+the root has a `video_meta.csv`, it then rewrites the metadata files, which list the videos of the
+split files.
+
+`meta` rewrites the metadata files (`video_meta.csv` and every `video_meta_<name>.csv`, and removes
+other `video_meta_*.csv` files) from the output root alone: the meta row columns from
+`video_meta.csv`, which `extract` and `derive` write from `.state/`; the videos of each file from
+the split files; `unreliable_spans` from `subs/` and the annotation files the dataset reads for it.
+It reads neither `persons/` nor `poses/` and needs no videos, so it takes seconds on any copy of an
+output root. The metadata columns are not part of the record (`meta.META_VERSION` does not cover
+them), so a change of these columns alone needs no `derive`, and `check` is not affected:
+```bash
+slp-pose meta --dataset bobsl --data-root /path/to/data --out-root /path/to/data/BOBSL/dwpose
+```
+It keeps the columns it does not compute (`copy_of`, and any column it does not know). Where an
+`unreliable_spans` value cannot be computed because its annotation files are missing, the file
+keeps its earlier value (blank at first) and the log names the missing files. While a file holds a
+blank `unreliable_spans` cell, `meta`, `splits` and `subs` exit with 1: misaligned-slt reads a blank
+cell as no span, so it would read the dropped cues of those videos as gaps.
 
 ## 6. Built-in datasets
 
@@ -285,6 +320,7 @@ It takes the output root's lock. Run it again after the annotations or videos ch
 | Video id | episode id, e.g. `5085344787448740525` | `abc_news_YYYY-MM-DD` | `VIDEO_NAME`, e.g. `--7E2sU6zP4-5-rgb_front` |
 | Splits | automatic: val 32, test 250, train 1658, challenge_test 272; manual: dev 4, test 15, train 36 | dev 8, test 16, train 101 | val 132, test 184, train 2213 |
 | Subtitles | `en` (automatic), `en-manual` (55 episodes) | `en` | `en` |
+| Metadata files | `video_meta.csv` (automatic split, `en`), `video_meta_manual.csv` (manual split, `en-manual`) | `video_meta.csv` | `video_meta.csv` |
 | `video_ids.csv` extras | `manual_split` | `subset`, `annotation_name` | none |
 | Rules (extraction / final) | `largest_bbox` / `signer_track_bobsl` | `right_largest` / `signer_track_right` | `largest_bbox` / `largest_bbox` |
 | Output root | `<data root>/BOBSL/dwpose/` | `<data root>/Auslan-Daily/dwpose/` | `<data root>/How2Sign/dwpose/` |
@@ -295,6 +331,17 @@ never a newsreader; and How2Sign's one person in front of a green screen. BOBSL'
 re-splits its 55 manually aligned episodes by interpreter, so like the official split it is
 signer-independent: score a model trained on it on its own `test` only. On 2x RTX 3090 Ti,
 extraction took about 8.5 days for BOBSL and about 10 hours each for Auslan News and How2Sign.
+
+BOBSL's manual metadata file marks where its subtitles do not hold the signing (`unreliable_spans` of
+`video_meta_manual.csv`): every cue of the manual files that slp-pose drops for a quality tag such as
+`[NOT-SIGNED]`. Only the original manual files hold these cues, so `subs` and `meta` read
+`<data root>/BOBSL/manual_annotations/signing_aligned_subtitles/`; without them the column stays
+blank (unknown).
+
+The automatic track (`video_meta.csv`), Auslan News and How2Sign have no such spans (`[]`). SAT's
+collapsed alignments (automatic cues of 4 frames, about a quarter of them) need none: misaligned-slt
+itself marks the gap around a cue shorter than its `subtitles.min_duration_s` as unlabelled, in every
+corpus.
 
 ### Data layout
 
@@ -335,31 +382,34 @@ details: subtitle sources and dropped cues, BOBSL's manual split, and each signe
 ## 7. Using the outputs in misaligned-slt
 
 An output root has the layout of a misaligned-slt language root: `poses/`, `video_meta.csv` and,
-after `slp-pose subs`, `subs/`. Each dataset is a separate benchmark: train and evaluate on one at a
-time, with its own split file and the subtitle track that goes with it.
+after `slp-pose subs`, `subs/`, the split files and the other metadata files. Each benchmark is
+separate: train and evaluate on one at a time, with its own split file, the subtitle track that goes
+with it and its own metadata file. The two BOBSL benchmarks share one root, so the manual one names
+its metadata file (misaligned-slt's `video_meta`; the default is `<root>/video_meta.csv`).
 
-| Benchmark | `root` | `splits.signverse_csv` | `subtitles.preferred_suffixes` |
-|---|---|---|---|
-| BOBSL, automatic alignment (official split) | `data/BOBSL/dwpose` | `data/BOBSL/dwpose/splits_automatic.csv` | `[.en.vtt]` |
-| BOBSL, manual alignment (55 episodes) | `data/BOBSL/dwpose` | `data/BOBSL/dwpose/splits_manual.csv` | `[.en-manual.vtt]` |
-| Auslan-Daily News | `data/Auslan-Daily/dwpose` | `data/Auslan-Daily/dwpose/splits.csv` | `[.en.vtt]` |
-| How2Sign | `data/How2Sign/dwpose` | `data/How2Sign/dwpose/splits.csv` | `[.en.vtt]` |
+| Benchmark | `root` | `video_meta` | `splits.signverse_csv` | `subtitles.preferred_suffixes` |
+|---|---|---|---|---|
+| BOBSL, automatic alignment (official split) | `data/BOBSL/dwpose` | (default) | `data/BOBSL/dwpose/splits_automatic.csv` | `[.en.vtt]` |
+| BOBSL, manual alignment (55 episodes) | `data/BOBSL/dwpose` | `data/BOBSL/dwpose/video_meta_manual.csv` | `data/BOBSL/dwpose/splits_manual.csv` | `[.en-manual.vtt]` |
+| Auslan-Daily News | `data/Auslan-Daily/dwpose` | (default) | `data/Auslan-Daily/dwpose/splits.csv` | `[.en.vtt]` |
+| How2Sign | `data/How2Sign/dwpose` | (default) | `data/How2Sign/dwpose/splits.csv` | `[.en.vtt]` |
 
 For example, BOBSL with its manual alignment in misaligned-slt's `configs/data.yaml`:
 
 ```yaml
-active_languages: [bobsl]
+active_languages: [bobsl_manual]
 languages:
-    bobsl:
-        name: BSL (BOBSL, slp-pose DWPose)
+    bobsl_manual:
+        name: BSL (BOBSL, manual alignment, re-split by interpreter)
         target_lang: en_XX
-        pretrained_slt: checkpoints/openasl_pose_only_slt.pth
+        pretrained_slt: {ar: checkpoints/openasl_pose_only_slt.pth, dlm: checkpoints/openasl_pose_only_slt.pth}
         root: /path/to/data/BOBSL/dwpose          # the slp-pose output root
-        pose: {fps: 25.0, width: 444, height: 444}    # fallbacks only: video_meta.csv has the real ones
-splits:
-    signverse_csv: /path/to/data/BOBSL/dwpose/splits_manual.csv
-subtitles:
-    preferred_suffixes: [.en-manual.vtt]
+        video_meta: /path/to/data/BOBSL/dwpose/video_meta_manual.csv
+        splits:
+            signverse_csv: /path/to/data/BOBSL/dwpose/splits_manual.csv
+        subtitles:
+            preferred_suffixes: [.en-manual.vtt]
+        pose: {width: 444, height: 444}    # fallbacks only: the metadata file has the real ones
 ```
 
 Things to know:
@@ -367,8 +417,14 @@ Things to know:
   misaligned-slt must accept mixed rates.
 - `val` is read as `dev`; unlisted videos and other splits (BOBSL's `challenge_test`) are left out.
 - Videos whose `caption_source` is `none` are dropped.
+- misaligned-slt's copy check writes `copy_of` into each metadata file; slp-pose keeps it, until
+  `subs` changes the subtitles of that file's track ([section 3](#3-outputs)).
+- Run `subs` or `meta` for BOBSL where the original manual annotation files are, else the
+  `unreliable_spans` of `video_meta_manual.csv` stay blank (unknown) and the command exits with 1.
 - The run columns follow `meta.MSLT_COMMIT`: when misaligned-slt changes them, port the change to
-  `slp_pose/meta.py`, bump `meta.META_VERSION` and run `slp-pose derive`.
+  `slp_pose/meta.py`, bump `meta.META_VERSION` and run `slp-pose derive`. When it changes only the
+  columns of the file, port the change to the CSV part of `slp_pose/meta.py` and run
+  `slp-pose meta`.
 
 ## 8. Adding a dataset
 
@@ -420,6 +476,8 @@ The framework constructs `cls(data_root)`, checks it and its videos (`slp_pose/d
 | `captions(video, fps)` | The video's subtitles ([below](#subtitles-and-splits)); default none. |
 | `caption_source` | What the subtitles are: `human` (default), `mt` or `shard`. |
 | `splits(videos)` | The split files; default one file from each video's `split`. |
+| `split_tracks` | The subtitle track of each split file, as `(split name, track)` pairs, each with its own metadata file ([below](#subtitles-and-splits)); default `(('', 'en'),)`. |
+| `unreliable_spans(video_id, track, cues)` | Where a track does not hold the signing ([below](#subtitles-and-splits)); default `[]`. |
 
 A `video_id` is the output file stem: `[A-Za-z0-9._-]+`, unique and not ending in `_segment_<n>`
 (`safe_id()` replaces other characters with `_`); its `path` must exist. For misaligned-slt, avoid
@@ -439,6 +497,18 @@ rate of the committed poses (a `Fraction`), for annotations timed in frames. Nam
 dataset needs (e.g. dropping cues the annotators marked as unusable); misaligned-slt cleans the
 text itself. A dataset with several split files, e.g. one per subtitle track, overrides
 `splits(videos)` and returns `{name: {video_id: split}}`; each name becomes `splits_<name>.csv`.
+
+Each split file goes with one subtitle track, which `split_tracks` names, e.g. BOBSL's
+`(('automatic', 'en'), ('manual', 'en-manual'))`. The first pair's metadata file is
+`video_meta.csv` (every committed video); every other pair gets `video_meta_<name>.csv` with the
+videos of `splits_<name>.csv`. A dataset whose annotations mark cues whose signing does not match
+drops them in `captions` and returns their spans from `unreliable_spans(video_id, track, cues)`:
+`(start, end)` in seconds, any order. `cues` is the track as `subs` wrote it. Return `[]` when
+there are none (the default). When the spans cannot be known, return `None` or let the
+`FileNotFoundError` of a missing source through: the column then keeps its earlier value, and the
+log names the missing file. `meta` calls it from the output root alone, where the videos may be
+absent, so it gets the video id, not the `Video`.
+
 `read_vtt` reads a WebVTT file:
 
 ```python
@@ -492,7 +562,8 @@ class LeftSigner(Dataset):
 - **Video-level:** `VideoRule(name, choose, params)`. `choose(people)` gets the posed people of a
   whole video (`PosedPeople`: boxes, scores, per-frame offsets, keypoints, fps, frame size) and
   returns a `SignerChoice`: per frame the signer's position among the posed people (-1 = nobody)
-  and the interpreter's region (NaN = none; `masked_runs` counts the people inside it).
+  and the interpreter's region (NaN = none; the meta row's `masked_runs` counts the people inside
+  it).
 - `pick` and `choose` can be any callable. Rule names match `[A-Za-z0-9._-]+`, are unique, and are
   not a framework rule's name. `slp_pose/signer.py` has building blocks for video-level rules
   (`track_rule`, `SignerTrackParams`, the spot and motion steps), as `examples/custom_rules.py`
@@ -520,9 +591,9 @@ parity-checked engines.
 | `slp_pose/env.py`, `fetch.py`, `engines.py` | start-up checks; `fetch-models`; ONNX export and TensorRT engines |
 | `slp_pose/video.py`, `prep.py`, `detpost.py`, `posepost.py` | decoding, the exact letterbox and crops, post-processing |
 | `slp_pose/select.py`, `signer.py`, `rules.py` | the signer rules and their building blocks |
-| `slp_pose/record.py`, `meta.py`, `types.py` | the `persons/` record, commit, resume, derive, check; `video_meta.csv` |
+| `slp_pose/record.py`, `meta.py`, `types.py` | the `persons/` record, commit, resume, derive, check; the metadata files |
 | `slp_pose/worker.py`, `run.py`, `decodelog.py` | the GPU workers, scheduling and supervision, decode logs |
-| `slp_pose/render.py`, `render_batch.py`, `subs.py`, `parity.py` | `render`, `render-done`, `subs`, `splits`, `parity` |
+| `slp_pose/render.py`, `render_batch.py`, `subs.py`, `parity.py` | `render`, `render-done`, `subs`, `splits`, `meta`, `parity` |
 | `slp_pose/model_configs/` | the YOLOX and DWPose configs (never edited: their sha256 is in the extraction hash) |
 | `examples/`, `scripts/` | the example datasets; `setup_env.sh`, `check_env.py`, `lock_requirements.sh` |
 | `requirements.txt`, `requirements-py38.txt` | hash-pinned locks for Python 3.11 and 3.8 |

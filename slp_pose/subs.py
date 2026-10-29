@@ -22,11 +22,18 @@ splits_manual.csv, one per subtitle alignment). Each is a CSV video_id,split tha
 its splits.signverse_csv (data.loader.build_splits; 'val' = dev, other split names and absent videos
 are left out). The datasets are separate benchmarks, so their splits are never merged.
 
+`write_meta_files` writes one metadata file (meta.py) per benchmark, i.e. per (split file, track)
+pair of Dataset.split_tracks: video_meta.csv for the first pair, video_meta_<name>.csv for each other
+(BOBSL: video_meta_manual.csv). It reads only the output root (video_meta.csv, the split files,
+subs/) and the sources that Dataset.unreliable_spans needs, never persons/ or poses/, so a change of
+the metadata columns alone costs no derive (`slp-pose meta`).
+
 `read_vtt` reads a source WebVTT file leniently (BOM, CRLF, NOTE / STYLE / REGION blocks, cue
 identifiers, multi-line text joined with a space) for datasets that ship VTT subtitles.
 """
 from __future__ import annotations
 
+import csv
 import json
 import logging
 import os
@@ -34,7 +41,7 @@ import re
 from dataclasses import dataclass, field
 from fractions import Fraction
 from pathlib import Path
-from typing import TYPE_CHECKING, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import TYPE_CHECKING, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple, Union
 
 if TYPE_CHECKING:
     from .datasets.base import Dataset
@@ -69,6 +76,7 @@ class SubsSummary:
     files_removed: int = 0                                # stale .vtt files deleted
     cues: Dict[str, int] = field(default_factory=dict)    # track -> cues written
     dropped: Dict[str, int] = field(default_factory=dict)  # track -> cues dropped (empty text or end <= start)
+    changed: Set[str] = field(default_factory=set)        # tracks with a file written or removed
 
 
 def parse_timestamp(text: str) -> Fraction:
@@ -206,6 +214,7 @@ def write_subs(dataset: 'Dataset', out_root: Path, videos: Optional[Sequence] = 
             keep.add(path.name)
             if _write_if_changed(path, vtt_text(kept)):
                 summary.files_written += 1
+                summary.changed.add(track)
             else:
                 summary.files_unchanged += 1
             summary.cues[track] = summary.cues.get(track, 0) + len(kept)
@@ -216,6 +225,7 @@ def write_subs(dataset: 'Dataset', out_root: Path, videos: Optional[Sequence] = 
         if path.name not in keep:
             path.unlink()
             summary.files_removed += 1
+            summary.changed.add(path.name[:-len('.vtt')].rsplit('.', 1)[-1])   # <vid>.<track>.vtt
     state = captions_json(out_root)
     state.parent.mkdir(parents=True, exist_ok=True)
     _write_if_changed(state, json.dumps(dict(sorted(sources.items())), indent=0) + '\n')
@@ -232,7 +242,6 @@ def write_splits(dataset: 'Dataset', out_root: Path, videos: Optional[Sequence] 
     `out_root`: header video_id,split and one row per video of the split, in the dataset's video order,
     atomically and only when the bytes change; delete the other splits*.csv files there. Returns
     {file name: {split: videos}}. ValueError for a split name that is not [A-Za-z0-9-]+."""
-    import csv
     import io
     from .datasets.base import load_videos
     videos = load_videos(dataset) if videos is None else videos
@@ -257,3 +266,80 @@ def write_splits(dataset: 'Dataset', out_root: Path, videos: Optional[Sequence] 
         if path.name not in counts:
             path.unlink()
     return counts
+
+
+def write_meta_files(dataset: 'Dataset', out_root: Path, changed: Iterable[str] = ()) -> Dict[str, Dict[str, int]]:
+    """Write the metadata file of each (split name, track) pair of dataset.split_tracks (module
+    docstring) and delete every other video_meta_*.csv of `out_root`. The first pair's file,
+    video_meta.csv, keeps every video it lists; each other pair's video_meta_<name>.csv lists the
+    videos of splits_<name>.csv that video_meta.csv lists. In each file:
+    - the meta row columns (meta.csv_row) are video_meta.csv's, which run.merge_meta writes from .state/;
+    - unreliable_spans is dataset.unreliable_spans on subs/<vid>.<track>.vtt (meta.merge_spans); where
+      it is unknown the file keeps its value, and a WARNING names the missing sources;
+    - copy_of and the columns slp-pose does not know keep the file's value (meta.rewrite_video_meta),
+      but copy_of is blank in the file of a track in `changed` (tracks whose subtitle files `subs`
+      changed): misaligned-slt's copy check must run again, as after its own subs stage.
+    Returns {file name: row counts}: videos, with_spans (a non-empty unreliable_spans), unknown_spans
+    (a blank one) and copy_of (a non-blank one). DatasetError when video_meta.csv or a split file is
+    missing."""
+    from . import meta
+    from .datasets.base import DatasetError
+    out_root, changed = Path(out_root), set(changed)
+    if not (out_root / 'video_meta.csv').is_file():
+        raise DatasetError(f'{out_root / "video_meta.csv"} is missing: run `slp-pose extract` first, or pass the '
+                           f'--out-root that holds it')
+    rows, _ = meta.read_video_meta(out_root / 'video_meta.csv')
+    counts: Dict[str, Dict[str, int]] = {}
+    for i, (name, track) in enumerate(dataset.split_tracks):
+        file_name = 'video_meta.csv' if i == 0 else f'video_meta_{name}.csv'
+        videos = sorted(rows) if i == 0 else _split_videos(out_root / f'splits_{name}.csv', rows)
+        out, missing, unknown = {}, [], 0
+        for vid in videos:
+            row = meta.csv_row(rows[vid])
+            path = subs_path(out_root, vid, track)
+            try:
+                spans = dataset.unreliable_spans(vid, track, read_vtt(path) if path.is_file() else [])
+            except FileNotFoundError as exc:
+                spans = None
+                missing.append(str(exc.filename or exc))
+            if spans is None:
+                unknown += 1
+            else:
+                row['unreliable_spans'] = meta.merge_spans(spans)
+            if track in changed:
+                row['copy_of'] = None
+            out[vid] = row
+        meta.rewrite_video_meta(out_root / file_name, out)
+        written = meta.read_video_meta(out_root / file_name)[0].values()
+        counts[file_name] = dict(videos=len(out), with_spans=sum(bool(r['unreliable_spans']) for r in written),
+                                 unknown_spans=sum(r['unreliable_spans'] is None for r in written),
+                                 copy_of=sum(r['copy_of'] is not None for r in written))
+        log.info('%s (track %s): %d videos; unreliable_spans: %d with spans, %d unknown; copy_of: %d kept%s',
+                 file_name, track, len(out), counts[file_name]['with_spans'], counts[file_name]['unknown_spans'],
+                 counts[file_name]['copy_of'], ' (blanked: its subtitles changed)' if track in changed else '')
+        if unknown:
+            more = f' and {len(missing) - 1} more such files' if len(missing) > 1 else ''
+            needs = f': it needs {missing[0]}{more}' if missing else ''
+            log.warning('%s: unreliable_spans of track %s is unknown here for %d of %d videos, which keep their '
+                        'earlier value (blank at first)%s; put them in place and run `slp-pose meta` again',
+                        file_name, track, unknown, len(out), needs)
+    for path in out_root.glob('video_meta_*.csv'):
+        if path.name not in counts:
+            path.unlink()
+    return counts
+
+
+def _split_videos(path: Path, rows: Mapping[str, object]) -> List[str]:
+    """The videos of the split file at `path` that `rows` (video_meta.csv's) lists."""
+    from .datasets.base import DatasetError
+    try:
+        with open(path, newline='', encoding='utf-8') as f:
+            videos = [line['video_id'] for line in csv.DictReader(f)]
+    except FileNotFoundError:
+        raise DatasetError(f'{path} is missing: run `slp-pose splits` (or `subs`) first; the split names of '
+                           f'Dataset.split_tracks must be names that Dataset.splits returns') from None
+    absent = [vid for vid in videos if vid not in rows]
+    if absent:
+        log.warning('%s: %d of its videos have no row in video_meta.csv (not committed), e.g. %s', path.name,
+                    len(absent), absent[0])
+    return [vid for vid in videos if vid in rows]

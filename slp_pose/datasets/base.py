@@ -28,7 +28,7 @@ from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 from ..rules import Rule, framework_names, framework_rule, is_framework_name
 from ..select import FrameRule
 from ..signer import VideoRule
-from ..subs import Cue
+from ..subs import TRACK, Cue, Seconds
 
 SAFE_ID = re.compile(r'[A-Za-z0-9._-]+')
 SEGMENT_SUFFIX = re.compile(r'_segment_\d+$')   # misaligned-slt names clips <video_id>_segment_<n>
@@ -91,6 +91,12 @@ class Dataset:
             and every Video.split must be one of them or None.
         caption_source: what the subtitles of `captions` are, for misaligned-slt's video_meta.csv
             caption_source column: 'human' (default), 'mt', 'shard' (subs.CAPTION_SOURCES).
+        split_tracks: the subtitle track that goes with each split file of `splits`, as (split name,
+            track) pairs: one misaligned-slt benchmark each, with its own metadata file
+            (subs.write_meta_files). The first pair's is video_meta.csv, with every committed video;
+            each other pair's is video_meta_<name>.csv, with the videos of splits_<name>.csv. Names
+            are distinct and match subs.TRACK, except that the first may be '' (splits.csv). Default:
+            splits.csv with the track 'en'.
 
     The framework constructs it as `cls(data_root)`; an overriding __init__ must call
     super().__init__(data_root). After construction `extraction_rule` is never None.
@@ -102,6 +108,7 @@ class Dataset:
     rules: Tuple[Rule, ...] = ()
     split_order: Tuple[str, ...] = ()
     caption_source: str = 'human'
+    split_tracks: Tuple[Tuple[str, str], ...] = (('', 'en'),)
 
     def __init__(self, data_root: os.PathLike) -> None:
         check_dataset_class(type(self))
@@ -125,6 +132,20 @@ class Dataset:
         one split per subtitle track). A video absent from a file has no split there. The default is
         one file with every video's own split (Video.split; videos without one are left out)."""
         return {'': {video.video_id: video.split for video in videos if video.split}}
+
+    def unreliable_spans(self, video_id: str, track: str,
+                         cues: Sequence[Cue]) -> Optional[Iterable[Tuple[Seconds, Seconds]]]:
+        """Where `track` does not hold the signing, for the metadata file's unreliable_spans column:
+        (start, end) in seconds of the video, any order (subs.write_meta_files sorts and merges
+        them). misaligned-slt quarantines every caption unit that overlaps one and reads its frames
+        as unlabelled, not as 'no sentence'. Example: a cue that `captions` drops because the
+        annotators marked its signing as not matching. `cues` is the track as `subs` wrote it
+        (subs/<video_id>.<track>.vtt; [] without that file). `slp-pose meta` calls it from the output
+        root alone, where the videos may be absent, so it gets the video id, not the Video.
+        Return [] for checked, none (the default: no known unreliable cues); None, or raise
+        FileNotFoundError for a source it needs, for unknown (the column then keeps its earlier
+        value, blank at first, and the log names the missing file)."""
+        return []
 
     def out_root(self) -> Path:
         """Default output root: <data root>/<name>/dwpose (override to put it elsewhere)."""
@@ -189,6 +210,15 @@ def check_dataset_class(cls: type) -> None:
     distinct = isinstance(order, tuple) and len(set(order)) == len(order)
     if not distinct or not all(isinstance(s, str) and s for s in order):
         raise DatasetError(f'{cls.name}: split_order must be a tuple of distinct non-empty str, got {order!r}')
+    pairs = cls.split_tracks
+    ok = isinstance(pairs, tuple) and len(pairs) > 0 and all(
+        isinstance(pair, tuple) and len(pair) == 2 and all(isinstance(s, str) for s in pair) for pair in pairs)
+    names = [name for name, _ in pairs] if ok else []
+    if not (ok and len(set(names)) == len(names) and all(TRACK.fullmatch(track) for _, track in pairs)
+            and all(TRACK.fullmatch(name) or (i == 0 and not name) for i, name in enumerate(names))):
+        raise DatasetError(f"{cls.name}: split_tracks must be a non-empty tuple of (split name, track) pairs with "
+                           f"distinct names; names and tracks match {TRACK.pattern}, only the first name may be '', "
+                           f"got {pairs!r}")
 
 
 def _check_own_rules(cls: type) -> None:
