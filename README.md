@@ -328,8 +328,8 @@ cell as no span, so it would read the dropped cues of those videos as gaps.
 The signer kept is BOBSL's interpreter, never a programme person; Auslan News's interpreter in the
 right-hand panel or full screen, or an on-site or picture-in-picture one while the panel is gone,
 never a newsreader; and How2Sign's one person in front of a green screen. BOBSL's manual split
-re-splits its 55 manually aligned episodes by interpreter, so like the official split it is
-signer-independent: score a model trained on it on its own `test` only. On 2x RTX 3090 Ti,
+is the official split of its 55 manually aligned episodes (16 train, 4 val, 35 test), so it is
+signer-independent like the automatic one. On 2x RTX 3090 Ti,
 extraction took about 8.5 days for BOBSL and about 10 hours each for Auslan News and How2Sign.
 
 BOBSL's manual metadata file marks where its subtitles do not hold the signing (`unreliable_spans` of
@@ -400,7 +400,7 @@ For example, BOBSL with its manual alignment in misaligned-slt's `configs/data.y
 active_languages: [bobsl_manual]
 languages:
     bobsl_manual:
-        name: BSL (BOBSL, manual alignment, re-split by interpreter)
+        name: BSL (BOBSL, manual alignment, official split)
         target_lang: en_XX
         pretrained_slt: {ar: checkpoints/openasl_pose_only_slt.pth, dlm: checkpoints/openasl_pose_only_slt.pth}
         root: /path/to/data/BOBSL/dwpose          # the slp-pose output root
